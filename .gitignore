@@ -30,6 +30,9 @@ go.work.sum
 # db files
 *.db
 
+# binaries
+godb
+
 # Editor/IDE
 # .idea/
 # .vscode/

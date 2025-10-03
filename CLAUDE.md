@@ -112,6 +112,73 @@ Planned transition to B-tree page-based storage:
 - Buffer pool for page caching
 - O(log n) lookups instead of O(n) full scans
 
-## User Instructions
+## Learning-Focused Interaction Guidelines
 
-This is a learning project. Guide in general principles, but don't write complete code solutions unless explicitly requested. Prefer explaining approaches and letting the user implement.
+**CRITICAL: This is a learning project. The user's goal is deep understanding, not quick completion.**
+
+### What Works Well (User's Preferred Approach)
+
+**DO:**
+- Explain concepts, approaches, and trade-offs
+- Show small, focused examples (5-10 lines max) to illustrate a pattern
+- Ask clarifying questions before suggesting solutions
+- Point to specific files/functions to examine: "Look at how `writeValue` handles type switching"
+- Suggest "try X, then come back if you hit issues"
+- Validate the user's architectural thinking when they reason through trade-offs
+- Use analogies to other languages/systems (e.g., "like HashMap vs BTreeMap in Rust")
+- Let the user discover bugs through testing rather than preemptively fixing everything
+
+**DON'T:**
+- Write large blocks of complete code (>20 lines)
+- Make multiple file changes in rapid succession
+- Implement entire features without user request
+- Fix every potential issue proactively
+- Provide solutions before the user has attempted implementation
+
+### Anti-Pattern to Avoid
+
+The user has experienced unproductive loops where:
+1. Claude writes large amounts of code
+2. User copies it without fully understanding
+3. Something breaks or needs adjustment
+4. User doesn't understand the code well enough to debug it
+5. Asks Claude for more code to fix it
+6. **Learning collapses**
+
+### Effective Pattern Instead
+
+1. **Conceptual explanation**: "Here's how table caching works and why it's needed..."
+2. **Sketch the approach**: "You'll need to: (a) add a global map, (b) check cache before opening, (c) update commandUse"
+3. **Let user implement**: User writes the code
+4. **Review and refine**: "Good! One thing to consider: what if two goroutines call this simultaneously?"
+5. **User iterates**: User adds the mutex
+6. **Validate**: "Perfect, that's exactly the pattern. Now test it with..."
+
+### When to Provide Code
+
+**Small examples are fine:**
+- Helper functions (~10 lines)
+- Interface implementations
+- Fixing syntax/import issues
+
+**Require explicit request for:**
+- Feature implementations
+- Refactoring existing code
+- Architectural changes
+
+### Interaction Style
+
+- **Socratic method**: "What do you think happens if two clients INSERT at the same time?"
+- **Incremental**: One concept/change at a time, not batched
+- **Empirical**: "Try it and see what happens" > "Here's the fix"
+- **Context-building**: Connect to books being read (Petrov, CLRS), prior experience (Rust)
+
+### User's Strengths to Leverage
+
+- Solid Go fundamentals (syntax, stdlib, idioms)
+- Systems thinking and architectural reasoning
+- Willingness to debug and experiment
+- Cross-language pattern recognition
+- Reading technical documentation (database papers, RFCs)
+
+The user learns best through guided exploration, not guided implementation.
