@@ -3,14 +3,15 @@ package store
 import (
 	"encoding/binary"
 	"fmt"
+	"godb/internal/schema"
 	"io"
 	"os"
 )
 
 type TableStore struct {
-	file       *os.File
-	schema     Schema
-	headerSize int64
+	File       *os.File
+	Schema     schema.Schema
+	HeaderSize int64
 }
 
 func NewTableStore(filename string) (*TableStore, error) {
@@ -19,16 +20,16 @@ func NewTableStore(filename string) (*TableStore, error) {
 		return nil, err
 	}
 
-	schema := Schema{
+	sch := schema.Schema{
 		TableName: "users",
-		Fields: []Field{
-			{Name: "id", Type: IntType},
-			{Name: "name", Type: StringType},
-			{Name: "age", Type: IntType},
+		Fields: []schema.Field{
+			{Name: "id", Type: schema.IntType},
+			{Name: "name", Type: schema.StringType},
+			{Name: "age", Type: schema.IntType},
 		},
 	}
 
-	ts := &TableStore{file: file, schema: schema}
+	ts := &TableStore{File: file, Schema: sch}
 
 	stat, _ := file.Stat()
 	if stat.Size() == 0 {
@@ -40,102 +41,162 @@ func NewTableStore(filename string) (*TableStore, error) {
 	return ts, nil
 }
 
-func (ts *TableStore) Insert(record Record) error {
+func CreateTableStore(filename string, sch schema.Schema) (*TableStore, error) {
+	file, err := os.OpenFile(filename, os.O_RDWR|os.O_CREATE, 0644)
+	if err != nil {
+		return nil, err
+	}
+
+	ts := &TableStore{
+		File:   file,
+		Schema: sch,
+	}
+
+	stat, _ := file.Stat()
+	if stat.Size() == 0 {
+		ts.WriteSchema()
+	} else {
+		return nil, fmt.Errorf("file already exists: %s", filename)
+	}
+
+	return ts, nil
+}
+
+func (ts *TableStore) Insert(record schema.Record) error {
 	// seek to the end (past header and all records)
-	if _, err := ts.file.Seek(0, io.SeekEnd); err != nil {
+	if _, err := ts.File.Seek(0, io.SeekEnd); err != nil {
 		return err
 	}
 
 	// write each field in schema order
-	for _, field := range ts.schema.Fields {
+	for _, field := range ts.Schema.Fields {
 		value, ok := record[field.Name]
 		if !ok {
 			return fmt.Errorf("missing field: %s", field.Name)
 		}
 
-		if err := writeValue(ts.file, field.Type, value); err != nil {
+		if err := writeValue(ts.File, field.Type, value); err != nil {
 			return err
 		}
 	}
 
-	return ts.file.Sync()
+	return ts.File.Sync()
 }
 
-func (ts *TableStore) ReadSchema() (Schema, error) {
-	schema := Schema{}
-	if _, err := ts.file.Seek(0, io.SeekStart); err != nil {
-		return Schema{}, err
+func (ts *TableStore) ReadSchema() (schema.Schema, error) {
+	sch := schema.Schema{}
+	if _, err := ts.File.Seek(0, io.SeekStart); err != nil {
+		return schema.Schema{}, err
 	}
 
 	// read the name of the table
-	name, err := readTableName(ts.file)
+	name, err := readTableName(ts.File)
 	if err != nil {
-		return Schema{}, err
+		return schema.Schema{}, err
 	}
-	schema.TableName = name
+	sch.TableName = name
 
 	// determine how many fields there are
 	numFieldsBytes := make([]byte, 4)
-	_, err = io.ReadFull(ts.file, numFieldsBytes)
+	_, err = io.ReadFull(ts.File, numFieldsBytes)
 	if err != nil {
-		return Schema{}, err
+		return schema.Schema{}, err
 	}
 	numFields := binary.LittleEndian.Uint32(numFieldsBytes)
 
 	// read each field from the file header
 	for i := 0; i < int(numFields); i++ {
-		field, err := readField(ts.file)
+		field, err := readField(ts.File)
 		if err != nil {
-			return Schema{}, err
+			return schema.Schema{}, err
 		}
-		schema.Fields = append(schema.Fields, field)
+		sch.Fields = append(sch.Fields, field)
 	}
 
-	ts.headerSize, _ = ts.file.Seek(0, io.SeekCurrent)
-	ts.schema = schema
-	return schema, nil
+	ts.HeaderSize, _ = ts.File.Seek(0, io.SeekCurrent)
+	ts.Schema = sch
+	return sch, nil
 }
 
 func (ts *TableStore) WriteSchema() error {
 	// write the table metadata
 	// table name data
-	if err := writeString(ts.file, ts.schema.TableName); err != nil {
+	if err := writeString(ts.File, ts.Schema.TableName); err != nil {
 		return err
 	}
 
 	// write number of fields
-	if err := writeUint32(ts.file, uint32(len(ts.schema.Fields))); err != nil {
+	if err := writeUint32(ts.File, uint32(len(ts.Schema.Fields))); err != nil {
 		return err
 	}
 
 	// write schema field breakdowns
-	for _, field := range ts.schema.Fields {
+	for _, field := range ts.Schema.Fields {
 		// field name
-		if err := writeString(ts.file, field.Name); err != nil {
+		if err := writeString(ts.File, field.Name); err != nil {
 			return err
 		}
 		// field type
-		if _, err := ts.file.Write([]byte{byte(field.Type)}); err != nil {
+		if _, err := ts.File.Write([]byte{byte(field.Type)}); err != nil {
 			return err
 		}
 	}
-	ts.headerSize, _ = ts.file.Seek(0, io.SeekCurrent)
+	ts.HeaderSize, _ = ts.File.Seek(0, io.SeekCurrent)
 	return nil
 }
 
-func (ts *TableStore) ScanAll() ([]Record, error) {
-	if _, err := ts.file.Seek(ts.headerSize, io.SeekStart); err != nil {
+func (ts *TableStore) Find(id int) (schema.Record, error) {
+	if _, err := ts.File.Seek(ts.HeaderSize, io.SeekStart); err != nil {
 		return nil, err
 	}
 
-	var records []Record
-	for {
-		record := make(Record)
+	var latestRecord schema.Record
+	found := false
 
-		for _, field := range ts.schema.Fields {
-			value, err := readValue(ts.file, field.Type)
+	for {
+		record := make(schema.Record)
+
+		for _, field := range ts.Schema.Fields {
+			value, err := readValue(ts.File, field.Type)
 			if err == io.EOF {
-				return records, nil
+				if !found {
+					return nil, fmt.Errorf("key not found: %d", id)
+				}
+				return latestRecord, nil
+			}
+			if err != nil {
+				return nil, err
+			}
+			record[field.Name] = value
+		}
+
+		if record["id"].(int32) == int32(id) {
+			latestRecord = record
+			found = true
+		}
+	}
+}
+
+func (ts *TableStore) ScanAll() ([]schema.Record, error) {
+	if _, err := ts.File.Seek(ts.HeaderSize, io.SeekStart); err != nil {
+		return nil, err
+	}
+
+	recordMap := make(map[int32]schema.Record)
+
+	for {
+		record := make(schema.Record)
+
+		// try to read all fields for this record
+		for _, field := range ts.Schema.Fields {
+			value, err := readValue(ts.File, field.Type)
+			if err == io.EOF {
+				// end of file - return what we have
+				uniqueRecords := make([]schema.Record, 0, len(recordMap))
+				for _, rec := range recordMap {
+					uniqueRecords = append(uniqueRecords, rec)
+				}
+				return uniqueRecords, nil
 			}
 			if err != nil {
 				return nil, fmt.Errorf("reading field %s: %w", field.Name, err)
@@ -143,7 +204,8 @@ func (ts *TableStore) ScanAll() ([]Record, error) {
 			record[field.Name] = value
 		}
 
-		records = append(records, record)
+		id := record["id"].(int32)
+		recordMap[id] = record
 	}
 }
 
@@ -179,43 +241,43 @@ func readTableName(r io.Reader) (string, error) {
 	return string(nameBytes), nil
 }
 
-func readField(r io.Reader) (Field, error) {
+func readField(r io.Reader) (schema.Field, error) {
 	lenBytes := make([]byte, 4)
 	_, err := io.ReadFull(r, lenBytes)
 	if err != nil {
-		return Field{}, err
+		return schema.Field{}, err
 	}
 	nameLength := binary.LittleEndian.Uint32(lenBytes)
 
 	nameBytes := make([]byte, nameLength)
 	_, err = io.ReadFull(r, nameBytes)
 	if err != nil {
-		return Field{}, err
+		return schema.Field{}, err
 	}
 	fieldName := string(nameBytes)
 
 	typeByte := make([]byte, 1)
 	_, err = io.ReadFull(r, typeByte)
 	if err != nil {
-		return Field{}, err
+		return schema.Field{}, err
 	}
-	fieldType := FieldType(typeByte[0])
+	fieldType := schema.FieldType(typeByte[0])
 
-	return Field{
+	return schema.Field{
 		Name: fieldName,
 		Type: fieldType,
 	}, nil
 }
 
-func writeValue(w io.Writer, fieldType FieldType, value any) error {
+func writeValue(w io.Writer, fieldType schema.FieldType, value any) error {
 	switch fieldType {
-	case IntType:
+	case schema.IntType:
 		v := value.(int32)
 		return writeUint32(w, uint32(v))
-	case StringType:
+	case schema.StringType:
 		s := value.(string)
 		return writeString(w, s)
-	case BoolType:
+	case schema.BoolType:
 		b := value.(bool)
 		if b {
 			_, err := w.Write([]byte{1})
@@ -229,17 +291,17 @@ func writeValue(w io.Writer, fieldType FieldType, value any) error {
 	}
 }
 
-func readValue(r io.Reader, fieldType FieldType) (any, error) {
+func readValue(r io.Reader, fieldType schema.FieldType) (any, error) {
 	switch fieldType {
-	case IntType:
+	case schema.IntType:
 		buf := make([]byte, 4)
 		if _, err := io.ReadFull(r, buf); err != nil {
 			return nil, err
 		}
 		return int32(binary.LittleEndian.Uint32(buf)), nil
-	case StringType:
+	case schema.StringType:
 		return readTableName(r)
-	case BoolType:
+	case schema.BoolType:
 		buf := make([]byte, 1)
 		if _, err := io.ReadFull(r, buf); err != nil {
 			return nil, err
