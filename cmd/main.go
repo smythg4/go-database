@@ -5,7 +5,9 @@ import (
 	"fmt"
 	"godb/internal/cli"
 	"godb/internal/store"
+	"io"
 	"log"
+	"net"
 	"os"
 	"strings"
 )
@@ -14,15 +16,71 @@ func cleanInput(text string) []string {
 	return strings.Fields(strings.ToLower(text))
 }
 
-func main() {
+func ProcessCommand(input string, config *cli.DatabaseConfig, w io.Writer) error {
+	cleanLine := cleanInput(input)
+	if len(cleanLine) == 0 {
+		return nil
+	}
+	cmd, ok := cli.CommandRegistry[cleanLine[0]]
+	if !ok {
+		return fmt.Errorf("unknown command")
+	}
+	return cmd.Callback(config, cleanLine[1:], w)
+}
+
+func RunREPL(config *cli.DatabaseConfig) {
 	scanner := bufio.NewScanner(os.Stdin)
+	for {
+		fmt.Printf("Go-DB [%s]> ", config.TableS.Schema.TableName)
+		scanner.Scan()
+		err := ProcessCommand(scanner.Text(), config, os.Stdout)
+		if err != nil {
+			fmt.Printf("Error: %v\n", err)
+		}
+	}
+}
+
+func handleTCPConnection(conn net.Conn, baseConfig *cli.DatabaseConfig) {
+	defer conn.Close()
+	log.Printf("Client connected: %s", conn.RemoteAddr().String())
+
+	sessionConfig := &cli.DatabaseConfig{
+		KeyValue: baseConfig.KeyValue,
+		TableS:   baseConfig.TableS,
+	}
+
+	writer := bufio.NewWriter(conn)
+	scanner := bufio.NewScanner(conn)
+
+	for scanner.Scan() {
+		input := scanner.Text()
+		log.Printf("Received: %s", input)
+
+		err := ProcessCommand(input, sessionConfig, conn)
+		if err != nil {
+			fmt.Fprintf(conn, "error: %v\n", err)
+		}
+
+		// send prompt for next command
+		fmt.Fprintf(writer, "\nGo-DB [%s]> ", sessionConfig.TableS.Schema.TableName)
+		writer.Flush()
+	}
+
+	if err := scanner.Err(); err != nil {
+		log.Printf("Scanner error: %v", err)
+	}
+	log.Printf("Client disconnected: %s", conn.RemoteAddr().String())
+}
+
+func main() {
+	log.SetOutput(os.Stderr)
 
 	kv, err := store.NewKVStore("test.db")
 	if err != nil {
 		log.Fatal(err)
 	}
 
-	ts, err := store.NewTableStore("table.db")
+	ts, err := cli.GetOrOpenTable("table.db")
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -32,25 +90,26 @@ func main() {
 		TableS:   ts,
 	}
 
-	for {
-		fmt.Printf("Go-DB [%s]> ", config.TableS.File.Name())
-		scanner.Scan()
-		line := scanner.Text()
-		clean_line := cleanInput(line)
-		if len(clean_line) > 0 {
-			// meta-command, use normal registry
-			command, ok := cli.CommandRegistry[clean_line[0]]
-			if ok {
-				err := command.Callback(config, clean_line[1:])
-				if err != nil {
-					fmt.Printf("Error with command %s: %s\n", command.Name, err)
-				}
-			} else {
-				fmt.Println("Unknown command")
+	go func() {
+		listener, err := net.Listen("tcp", ":42069")
+		if err != nil {
+			log.Printf("TCP server failed: %v", err)
+			return
+		}
+		defer listener.Close()
+
+		log.Printf("TCP server listening on %v\n", listener.Addr().String())
+
+		for {
+			conn, err := listener.Accept()
+			if err != nil {
+				log.Printf("accept failed: %v", err)
+				continue
 			}
 
-		} else {
-			continue
+			go handleTCPConnection(conn, config)
 		}
-	}
+	}()
+
+	RunREPL(config)
 }

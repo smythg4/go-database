@@ -5,10 +5,33 @@ import (
 	"fmt"
 	"godb/internal/schema"
 	"godb/internal/store"
+	"io"
 	"os"
 	"strconv"
 	"strings"
+	"sync"
 )
+
+var (
+	tableCacheMu sync.RWMutex
+	tableCache   = make(map[string]*store.TableStore)
+)
+
+func GetOrOpenTable(filename string) (*store.TableStore, error) {
+	tableCacheMu.Lock()
+	defer tableCacheMu.Unlock()
+
+	if ts, ok := tableCache[filename]; ok {
+		return ts, nil
+	}
+
+	ts, err := store.NewTableStore(filename)
+	if err != nil {
+		return nil, err
+	}
+	tableCache[filename] = ts
+	return ts, nil
+}
 
 type DatabaseConfig struct {
 	KeyValue *store.KVStore
@@ -18,7 +41,7 @@ type DatabaseConfig struct {
 type CliCommand struct {
 	Name        string
 	Description string
-	Callback    func(*DatabaseConfig, []string) error
+	Callback    func(*DatabaseConfig, []string, io.Writer) error
 }
 
 var CommandRegistry map[string]CliCommand
@@ -73,15 +96,13 @@ func init() {
 	}
 }
 
-func commandCreate(config *DatabaseConfig, params []string) error {
+func commandCreate(config *DatabaseConfig, params []string, w io.Writer) error {
 	if len(params) < 2 {
 		return errors.New("must provide at least a table name with a single field")
 	}
 
 	tName := params[0]
 	fName := tName + ".db"
-
-	fmt.Printf("New Filename: %s\n", fName)
 
 	fields := make([]schema.Field, 0, len(params)-1)
 	for _, paramPair := range params[1:] {
@@ -111,26 +132,27 @@ func commandCreate(config *DatabaseConfig, params []string) error {
 		return err
 	}
 	config.TableS = newTableStore
-
+	fmt.Fprintf(w, "New table created: %s\n", newTableStore.Schema.TableName)
 	return nil
 }
 
-func commandUse(config *DatabaseConfig, params []string) error {
+func commandUse(config *DatabaseConfig, params []string, w io.Writer) error {
 	if len(params) != 1 {
 		return errors.New("must provide table name to use -- try SHOW first")
 	}
 
 	tName := params[0]
 
-	ts, err := store.NewTableStore(tName + ".db")
+	ts, err := GetOrOpenTable(tName + ".db")
 	if err != nil {
 		return err
 	}
 	config.TableS = ts
+	fmt.Fprintf(w, "Switching to table: %s\n", tName)
 	return nil
 }
 
-func commandShow(config *DatabaseConfig, params []string) error {
+func commandShow(config *DatabaseConfig, params []string, w io.Writer) error {
 	files, err := os.ReadDir(".")
 	if err != nil {
 		return err
@@ -138,31 +160,31 @@ func commandShow(config *DatabaseConfig, params []string) error {
 
 	for _, file := range files {
 		if strings.HasSuffix(file.Name(), ".db") {
-			fmt.Println(strings.TrimSuffix(file.Name(), ".db"))
+			fmt.Fprintln(w, strings.TrimSuffix(file.Name(), ".db"))
 		}
 
 	}
 	return nil
 }
 
-func commandHelp(config *DatabaseConfig, params []string) error {
-	fmt.Println("Welcome to Go-DB!")
-	fmt.Println("Usage: ")
-	fmt.Println()
+func commandHelp(config *DatabaseConfig, params []string, w io.Writer) error {
+	fmt.Fprintln(w, "Welcome to Go-DB!")
+	fmt.Fprintln(w, "Usage: ")
+	fmt.Fprintln(w)
 
 	for name, cmd := range CommandRegistry {
-		fmt.Printf("%s: %s\n", name, cmd.Description)
+		fmt.Fprintf(w, "%s: %s\n", name, cmd.Description)
 	}
 	return nil
 }
 
-func commandExit(config *DatabaseConfig, params []string) error {
-	fmt.Println("Closing Go-DB... goodbye!")
+func commandExit(config *DatabaseConfig, params []string, w io.Writer) error {
+	fmt.Fprintln(w, "Closing Go-DB... goodbye!")
 	os.Exit(0)
 	return nil
 }
 
-func commandPut(config *DatabaseConfig, params []string) error {
+func commandPut(config *DatabaseConfig, params []string, w io.Writer) error {
 	// initial persistent storage technique
 
 	if len(params) != 2 {
@@ -177,10 +199,11 @@ func commandPut(config *DatabaseConfig, params []string) error {
 	if err != nil {
 		return err
 	}
+	fmt.Fprintf(w, "Adding %d -> %d to KV file", key, value)
 	return config.KeyValue.Put(int32(key), int32(value))
 }
 
-func commandGet(config *DatabaseConfig, params []string) error {
+func commandGet(config *DatabaseConfig, params []string, w io.Writer) error {
 	// initial persistent retrieval technique
 
 	if len(params) != 1 {
@@ -196,11 +219,11 @@ func commandGet(config *DatabaseConfig, params []string) error {
 	if !ok {
 		return errors.New("key not found")
 	}
-	fmt.Printf("%d -> %d\n", key, val)
+	fmt.Fprintf(w, "%d -> %d\n", key, val)
 	return nil
 }
 
-func commandInsert(config *DatabaseConfig, params []string) error {
+func commandInsert(config *DatabaseConfig, params []string, w io.Writer) error {
 	fieldCount := len(config.TableS.Schema.Fields)
 
 	if len(params) != fieldCount {
@@ -216,31 +239,56 @@ func commandInsert(config *DatabaseConfig, params []string) error {
 		}
 		record[field.Name] = value
 	}
-
+	fmt.Fprintf(w, "Inserting %+v into table %s\n", record, config.TableS.Schema.TableName)
 	return config.TableS.Insert(record)
 }
 
-func selectAll(config *DatabaseConfig) error {
+func selectAll(config *DatabaseConfig, w io.Writer) error {
 	records, err := config.TableS.ScanAll()
 	if err != nil {
 		return err
 	}
 
-	for i, record := range records {
-		fmt.Printf("%d: ", i)
-		for _, field := range config.TableS.Schema.Fields {
-			fmt.Printf("%s=%v ", field.Name, record[field.Name])
+	fieldNames := config.TableS.Schema.GetFieldNames()
+	widths := make([]int, len(fieldNames))
+	for i, field := range fieldNames {
+		widths[i] = len(field) * 2
+	}
+	fmt.Fprint(w, "| ")
+	for i, field := range fieldNames {
+		fmt.Fprintf(w, "%-*s | ", widths[i], field)
+	}
+	fmt.Fprintln(w)
+	fmt.Fprintln(w, strings.Repeat("-", len(fieldNames)*20))
+
+	for _, record := range records {
+		fmt.Fprint(w, "| ")
+		for i, field := range config.TableS.Schema.Fields {
+			val := fmt.Sprintf("%v", record[field.Name])
+			fmt.Fprintf(w, "%-*s | ", widths[i], val)
 		}
-		fmt.Println()
+		fmt.Fprintln(w)
 	}
 
 	return nil
 }
 
-func commandSelect(config *DatabaseConfig, params []string) error {
+func commandSelect(config *DatabaseConfig, params []string, w io.Writer) error {
 	if len(params) == 0 {
-		return selectAll(config)
+		return selectAll(config, w)
 	}
+
+	fieldNames := config.TableS.Schema.GetFieldNames()
+	widths := make([]int, len(fieldNames))
+	for i, field := range fieldNames {
+		widths[i] = len(field) * 2
+	}
+	fmt.Fprint(w, "| ")
+	for i, field := range fieldNames {
+		fmt.Fprintf(w, "%-*s | ", widths[i], field)
+	}
+	fmt.Fprintln(w)
+	fmt.Fprintln(w, strings.Repeat("-", len(fieldNames)*20))
 
 	id, err := strconv.Atoi(params[0])
 	if err != nil {
@@ -249,10 +297,12 @@ func commandSelect(config *DatabaseConfig, params []string) error {
 
 	record, err := config.TableS.Find(id)
 
-	for _, field := range config.TableS.Schema.Fields {
-		fmt.Printf("%s=%v ", field.Name, record[field.Name])
+	fmt.Fprint(w, "| ")
+	for i, field := range config.TableS.Schema.Fields {
+		val := fmt.Sprintf("%v", record[field.Name])
+		fmt.Fprintf(w, "%-*s | ", widths[i], val)
 	}
-	fmt.Println()
+	fmt.Fprintln(w)
 
 	return err
 }

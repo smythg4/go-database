@@ -5,13 +5,16 @@ import (
 	"fmt"
 	"godb/internal/schema"
 	"io"
+	"math"
 	"os"
+	"sync"
 )
 
 type TableStore struct {
 	File       *os.File
 	Schema     schema.Schema
 	HeaderSize int64
+	mu         sync.RWMutex
 }
 
 func NewTableStore(filename string) (*TableStore, error) {
@@ -21,7 +24,7 @@ func NewTableStore(filename string) (*TableStore, error) {
 	}
 
 	sch := schema.Schema{
-		TableName: "users",
+		TableName: "table",
 		Fields: []schema.Field{
 			{Name: "id", Type: schema.IntType},
 			{Name: "name", Type: schema.StringType},
@@ -63,6 +66,8 @@ func CreateTableStore(filename string, sch schema.Schema) (*TableStore, error) {
 }
 
 func (ts *TableStore) Insert(record schema.Record) error {
+	ts.mu.Lock()
+	defer ts.mu.Unlock()
 	// seek to the end (past header and all records)
 	if _, err := ts.File.Seek(0, io.SeekEnd); err != nil {
 		return err
@@ -90,7 +95,7 @@ func (ts *TableStore) ReadSchema() (schema.Schema, error) {
 	}
 
 	// read the name of the table
-	name, err := readTableName(ts.File)
+	name, err := readString(ts.File)
 	if err != nil {
 		return schema.Schema{}, err
 	}
@@ -146,6 +151,8 @@ func (ts *TableStore) WriteSchema() error {
 }
 
 func (ts *TableStore) Find(id int) (schema.Record, error) {
+	ts.mu.RLock()
+	defer ts.mu.RUnlock()
 	if _, err := ts.File.Seek(ts.HeaderSize, io.SeekStart); err != nil {
 		return nil, err
 	}
@@ -178,6 +185,8 @@ func (ts *TableStore) Find(id int) (schema.Record, error) {
 }
 
 func (ts *TableStore) ScanAll() ([]schema.Record, error) {
+	ts.mu.RLock()
+	defer ts.mu.RUnlock()
 	if _, err := ts.File.Seek(ts.HeaderSize, io.SeekStart); err != nil {
 		return nil, err
 	}
@@ -216,6 +225,13 @@ func writeUint32(w io.Writer, v uint32) error {
 	return err
 }
 
+func writeFloat64(w io.Writer, v float64) error {
+	buf := make([]byte, 8)
+	binary.LittleEndian.PutUint64(buf, math.Float64bits(v))
+	_, err := w.Write(buf)
+	return err
+}
+
 func writeString(w io.Writer, s string) error {
 	if err := writeUint32(w, uint32(len(s))); err != nil {
 		return err
@@ -224,7 +240,16 @@ func writeString(w io.Writer, s string) error {
 	return err
 }
 
-func readTableName(r io.Reader) (string, error) {
+func readFloat64(r io.Reader) (float64, error) {
+	buf := make([]byte, 8)
+	if _, err := io.ReadFull(r, buf); err != nil {
+		return 0, err
+	}
+	bits := binary.LittleEndian.Uint64(buf)
+	return math.Float64frombits(bits), nil
+}
+
+func readString(r io.Reader) (string, error) {
 	lenBytes := make([]byte, 4)
 	_, err := io.ReadFull(r, lenBytes)
 	if err != nil {
@@ -286,6 +311,9 @@ func writeValue(w io.Writer, fieldType schema.FieldType, value any) error {
 			_, err := w.Write([]byte{0})
 			return err
 		}
+	case schema.FloatType:
+		f := value.(float64)
+		return writeFloat64(w, f)
 	default:
 		return fmt.Errorf("unsupported type: %v", fieldType)
 	}
@@ -300,13 +328,15 @@ func readValue(r io.Reader, fieldType schema.FieldType) (any, error) {
 		}
 		return int32(binary.LittleEndian.Uint32(buf)), nil
 	case schema.StringType:
-		return readTableName(r)
+		return readString(r)
 	case schema.BoolType:
 		buf := make([]byte, 1)
 		if _, err := io.ReadFull(r, buf); err != nil {
 			return nil, err
 		}
 		return buf[0] != 0, nil
+	case schema.FloatType:
+		return readFloat64(r)
 	default:
 		return nil, fmt.Errorf("unsupported type: %v", fieldType)
 	}
