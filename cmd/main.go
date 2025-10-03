@@ -9,7 +9,9 @@ import (
 	"log"
 	"net"
 	"os"
+	"os/signal"
 	"strings"
+	"syscall"
 )
 
 func cleanInput(text string) []string {
@@ -52,6 +54,8 @@ func handleTCPConnection(conn net.Conn, baseConfig *cli.DatabaseConfig) {
 	writer := bufio.NewWriter(conn)
 	scanner := bufio.NewScanner(conn)
 
+	fmt.Fprintf(writer, "Go-DB [%s]> ", sessionConfig.TableS.Schema.TableName)
+	_ = writer.Flush()
 	for scanner.Scan() {
 		input := scanner.Text()
 		log.Printf("Received: %s", input)
@@ -89,6 +93,16 @@ func main() {
 		KeyValue: kv,
 		TableS:   ts,
 	}
+
+	sigCh := make(chan os.Signal, 1)
+	signal.Notify(sigCh, os.Interrupt, syscall.SIGTERM)
+
+	go func() {
+		<-sigCh
+		fmt.Println("\nShutting down gracefully...")
+		_ = cli.CommandRegistry["exit"].Callback(config, []string{}, os.Stdout)
+		os.Exit(0)
+	}()
 
 	go func() {
 		listener, err := net.Listen("tcp", ":42069")

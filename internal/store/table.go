@@ -65,6 +65,10 @@ func CreateTableStore(filename string, sch schema.Schema) (*TableStore, error) {
 	return ts, nil
 }
 
+func (ts *TableStore) Close() error {
+	return ts.File.Close()
+}
+
 func (ts *TableStore) Insert(record schema.Record) error {
 	ts.mu.Lock()
 	defer ts.mu.Unlock()

@@ -6,6 +6,7 @@ import (
 	"godb/internal/schema"
 	"godb/internal/store"
 	"io"
+	"net"
 	"os"
 	"strconv"
 	"strings"
@@ -29,6 +30,23 @@ func GetOrOpenTable(filename string) (*store.TableStore, error) {
 	if err != nil {
 		return nil, err
 	}
+	tableCache[filename] = ts
+	return ts, nil
+}
+
+func CreateTable(filename string, sch schema.Schema) (*store.TableStore, error) {
+	tableCacheMu.Lock()
+	defer tableCacheMu.Unlock()
+
+	if _, ok := tableCache[filename]; ok {
+		return nil, fmt.Errorf("table already open: %s", filename)
+	}
+
+	ts, err := store.CreateTableStore(filename, sch)
+	if err != nil {
+		return nil, err
+	}
+
 	tableCache[filename] = ts
 	return ts, nil
 }
@@ -127,7 +145,7 @@ func commandCreate(config *DatabaseConfig, params []string, w io.Writer) error {
 		Fields:    fields,
 	}
 
-	newTableStore, err := store.CreateTableStore(fName, sch)
+	newTableStore, err := CreateTable(fName, sch)
 	if err != nil {
 		return err
 	}
@@ -180,7 +198,18 @@ func commandHelp(config *DatabaseConfig, params []string, w io.Writer) error {
 
 func commandExit(config *DatabaseConfig, params []string, w io.Writer) error {
 	fmt.Fprintln(w, "Closing Go-DB... goodbye!")
-	os.Exit(0)
+
+	if conn, ok := w.(net.Conn); ok {
+		return conn.Close()
+
+	}
+	defer os.Exit(0)
+	for _, v := range tableCache {
+		err := v.Close()
+		if err != nil {
+			return err
+		}
+	}
 	return nil
 }
 
@@ -252,7 +281,7 @@ func selectAll(config *DatabaseConfig, w io.Writer) error {
 	fieldNames := config.TableS.Schema.GetFieldNames()
 	widths := make([]int, len(fieldNames))
 	for i, field := range fieldNames {
-		widths[i] = len(field) * 2
+		widths[i] = len(field) * 4
 	}
 	fmt.Fprint(w, "| ")
 	for i, field := range fieldNames {
@@ -281,7 +310,7 @@ func commandSelect(config *DatabaseConfig, params []string, w io.Writer) error {
 	fieldNames := config.TableS.Schema.GetFieldNames()
 	widths := make([]int, len(fieldNames))
 	for i, field := range fieldNames {
-		widths[i] = len(field) * 2
+		widths[i] = len(field) * 4
 	}
 	fmt.Fprint(w, "| ")
 	for i, field := range fieldNames {
