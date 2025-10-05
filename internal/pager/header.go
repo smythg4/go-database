@@ -1,4 +1,4 @@
-package godatabase
+package pager
 
 import (
 	"bytes"
