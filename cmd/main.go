@@ -4,7 +4,6 @@ import (
 	"bufio"
 	"fmt"
 	"godb/internal/cli"
-	"godb/internal/store"
 	"io"
 	"log"
 	"net"
@@ -47,8 +46,7 @@ func handleTCPConnection(conn net.Conn, baseConfig *cli.DatabaseConfig) {
 	log.Printf("Client connected: %s", conn.RemoteAddr().String())
 
 	sessionConfig := &cli.DatabaseConfig{
-		KeyValue: baseConfig.KeyValue,
-		TableS:   baseConfig.TableS,
+		TableS: baseConfig.TableS,
 	}
 
 	writer := bufio.NewWriter(conn)
@@ -79,19 +77,13 @@ func handleTCPConnection(conn net.Conn, baseConfig *cli.DatabaseConfig) {
 func main() {
 	log.SetOutput(os.Stderr)
 
-	kv, err := store.NewKVStore("test.db")
-	if err != nil {
-		log.Fatal(err)
-	}
-
 	ts, err := cli.GetOrOpenTable("table.db")
 	if err != nil {
 		log.Fatal(err)
 	}
 
 	config := &cli.DatabaseConfig{
-		KeyValue: kv,
-		TableS:   ts,
+		TableS: ts,
 	}
 
 	sigCh := make(chan os.Signal, 1)

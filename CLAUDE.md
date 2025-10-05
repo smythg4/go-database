@@ -46,13 +46,45 @@ A handrolled database implementation in Go with multi-client TCP server support,
 - Dynamic schema: INSERT/SELECT adapt to current table's field definitions
 - Formatted output: Column-aligned tables with field names as headers
 
-### Legacy B-Tree Scaffolding (`godatabase` package)
+### B-Tree Page-Based Storage (In Development - `godatabase` package)
 
-**btree.go** + **memory_disk.go** - CLRS-based B-tree implementation:
-- Not currently used by CLI
-- `DiskManager` interface for page-based I/O abstraction
-- Implements insertion, search, and node splitting
-- Will be replaced with page-based storage following Petrov's approach
+**page.go** - Slotted page implementation for B-tree nodes:
+- `SlottedPage`: In-memory representation with header, slot array, and records
+  - Header: PageType (LEAF/INTERNAL), NumSlots, FreeSpacePtr, RightmostChild
+  - Slot array grows down from header, records grow up from end
+  - 4KB fixed page size (PAGE_SIZE = 4096)
+- `Page`: Raw disk representation ([4096]byte array)
+- Key methods:
+  - `InsertRecordSorted`: Binary search insertion maintaining key order
+  - `Search`: Binary search for exact key match in leaf nodes
+  - `SearchInternal`: Routes search to correct child page in internal nodes
+  - `SplitLeaf/SplitInternal`: Node splitting with promoted key handling
+  - `Compact`: Removes deleted record gaps by repacking active records
+  - `Serialize/Deserialize`: Convert between in-memory and disk representations
+- Record formats:
+  - Leaf: [key: 8 bytes][full record data: variable]
+  - Internal: [key: 8 bytes][child PageID: 4 bytes]
+- First field in schema is always the key (stored as first 8 bytes of record)
+
+**header.go** - Table metadata for B-tree storage:
+- `TableHeader`: Magic number ("GDBT"), version, RootPageID, NextPageID, NumPages, Schema
+- Page 0 reserved for header (padded to 4KB), B-tree nodes start at page 1
+- NextPageID tracks next available page for allocation during splits
+
+**disk_manager.go** - Page-level I/O:
+- `ReadPage/WritePage`: Load/store raw Page at calculated offset (pageID * PAGE_SIZE)
+- `ReadSlottedPage/WriteSlottedPage`: High-level wrappers with serialization
+- `ReadHeader/WriteHeader`: Table metadata at offset 0
+
+**page_test.go** - Comprehensive test suite:
+- Round-trip serialization tests
+- Sorted insertion verification
+- Leaf and internal node split tests with child pointer validation
+- Full disk I/O integration tests
+
+**btree.go** + **memory_disk.go** - Legacy CLRS-based implementation:
+- Original B-tree scaffolding, not currently integrated with new page system
+- Will be refactored to use SlottedPage infrastructure
 
 ## Development Commands
 
@@ -69,6 +101,15 @@ nc localhost 42069
 # Format and vet
 go fmt ./...
 go vet ./...
+
+# Run all tests
+go test ./...
+
+# Run specific test
+go test -v -run TestLeafSplit
+
+# Run page-related tests (requires multiple files)
+go test -v -run TestLeafSplit page_test.go page.go disk_manager.go header.go
 ```
 
 ## Key Design Decisions
@@ -103,14 +144,27 @@ go vet ./...
 - Table names in prompts: Read from `TableStore.Schema.TableName` (file header), not filename
 - Server logs go to stderr (`log.SetOutput(os.Stderr)`) to avoid REPL interference
 
-## Next Steps (Future Development)
+## Current Development Status
 
-Planned transition to B-tree page-based storage:
-- Fixed 4KB pages instead of append-only variable-length records
-- Slotted page layout with page headers
-- Page-level locking instead of file-level mutex
+B-tree page-based storage is **in active development**:
+
+**Completed:**
+- ✅ Slotted page layout with serialization/deserialization
+- ✅ Binary search for sorted key insertion and lookup
+- ✅ Leaf node splits with promoted key handling
+- ✅ Internal node splits with RightmostChild pointer management
+- ✅ Page-level I/O with DiskManager
+- ✅ Table header with PageID allocation tracking
+- ✅ Comprehensive test suite for pages and splits
+
+**Next Steps:**
+- BTree struct to orchestrate recursive insertion with split propagation
+- Root split handling (creates new root with 2 children)
+- Search implementation with tree traversal
+- Integration with existing CLI/schema system
+- Node merging/rebalancing (optional optimization, can defer)
 - Buffer pool for page caching
-- O(log n) lookups instead of O(n) full scans
+- Replace append-only TableStore with B-tree backend
 
 ## Learning-Focused Interaction Guidelines
 

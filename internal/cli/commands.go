@@ -52,8 +52,7 @@ func CreateTable(filename string, sch schema.Schema) (*store.TableStore, error) 
 }
 
 type DatabaseConfig struct {
-	KeyValue *store.KVStore
-	TableS   *store.TableStore
+	TableS *store.TableStore
 }
 
 type CliCommand struct {
@@ -85,16 +84,6 @@ func init() {
 			Name:        "select",
 			Description: "Perform a SQL SELECT action",
 			Callback:    commandSelect,
-		},
-		"put": {
-			Name:        "put",
-			Description: "insert a value to the db",
-			Callback:    commandPut,
-		},
-		"get": {
-			Name:        "get",
-			Description: "get a value from the db",
-			Callback:    commandGet,
 		},
 		"show": {
 			Name:        "show",
@@ -199,10 +188,12 @@ func commandHelp(config *DatabaseConfig, params []string, w io.Writer) error {
 func commandExit(config *DatabaseConfig, params []string, w io.Writer) error {
 	fmt.Fprintln(w, "Closing Go-DB... goodbye!")
 
+	// if the client is remote, just close the connection
 	if conn, ok := w.(net.Conn); ok {
 		return conn.Close()
-
 	}
+
+	// for local clients, close the entire db
 	defer os.Exit(0)
 	for _, v := range tableCache {
 		err := v.Close()
@@ -210,45 +201,6 @@ func commandExit(config *DatabaseConfig, params []string, w io.Writer) error {
 			return err
 		}
 	}
-	return nil
-}
-
-func commandPut(config *DatabaseConfig, params []string, w io.Writer) error {
-	// initial persistent storage technique
-
-	if len(params) != 2 {
-		return errors.New("you must provide a key and a value")
-	}
-
-	key, err := strconv.Atoi(params[0])
-	if err != nil {
-		return err
-	}
-	value, err := strconv.Atoi(params[1])
-	if err != nil {
-		return err
-	}
-	fmt.Fprintf(w, "Adding %d -> %d to KV file", key, value)
-	return config.KeyValue.Put(int32(key), int32(value))
-}
-
-func commandGet(config *DatabaseConfig, params []string, w io.Writer) error {
-	// initial persistent retrieval technique
-
-	if len(params) != 1 {
-		return errors.New("you must provide a key")
-	}
-
-	key, err := strconv.Atoi(params[0])
-	if err != nil {
-		return err
-	}
-
-	val, ok := config.KeyValue.Get(int32(key))
-	if !ok {
-		return errors.New("key not found")
-	}
-	fmt.Fprintf(w, "%d -> %d\n", key, val)
 	return nil
 }
 

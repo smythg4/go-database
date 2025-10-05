@@ -1,7 +1,11 @@
 package schema
 
 import (
+	"bytes"
+	"encoding/binary"
 	"fmt"
+	"godb/internal/encoding"
+	"io"
 	"strconv"
 )
 
@@ -74,4 +78,171 @@ func (s *Schema) GetFieldNames() []string {
 	return names
 }
 
+func (s *Schema) Serialize() ([]byte, error) {
+	buf := new(bytes.Buffer)
+
+	// write table name data
+	if err := encoding.WriteString(buf, s.TableName); err != nil {
+		return nil, err
+	}
+	// write number of fields
+	if err := encoding.WriteUint32(buf, uint32(len(s.Fields))); err != nil {
+		return nil, err
+	}
+
+	for _, field := range s.Fields {
+		// field name
+		if err := encoding.WriteString(buf, field.Name); err != nil {
+			return nil, err
+		}
+		// field type
+		if _, err := buf.Write([]byte{byte(field.Type)}); err != nil {
+			return nil, err
+		}
+	}
+
+	return buf.Bytes(), nil
+}
+
+func Deserialize(r io.Reader) (Schema, error) {
+	sch := Schema{}
+
+	// read table name
+	name, err := encoding.ReadString(r)
+	if err != nil {
+		return Schema{}, err
+	}
+	sch.TableName = name
+
+	// read number of fields
+	numFields, err := encoding.ReadUint32(r)
+	if err != nil {
+		return Schema{}, err
+	}
+
+	// read each field
+	sch.Fields = make([]Field, numFields)
+	for i := 0; i < int(numFields); i++ {
+		fieldName, err := encoding.ReadString(r)
+		if err != nil {
+			return Schema{}, err
+		}
+
+		typeByte := make([]byte, 1)
+		_, err = r.Read(typeByte)
+		if err != nil {
+			return Schema{}, err
+		}
+
+		sch.Fields[i] = Field{
+			Name: fieldName,
+			Type: FieldType(typeByte[0]),
+		}
+	}
+
+	return sch, nil
+}
+
+func (s *Schema) SerializeRecord(rec Record) ([]byte, error) {
+	buf := new(bytes.Buffer)
+
+	// first field is always the key
+	keyField := s.Fields[0]
+	keyVal, ok := rec[keyField.Name]
+	if !ok {
+		return nil, fmt.Errorf("missing the key field: %s", keyField.Name)
+	}
+
+	// write key as uint64
+	var key uint64
+	switch v := keyVal.(type) {
+	case int32:
+		key = uint64(v)
+	default:
+		return nil, fmt.Errorf("key must be int32 for now")
+	}
+
+	if err := binary.Write(buf, binary.LittleEndian, key); err != nil {
+		return nil, err
+	}
+
+	// write all fields (including key again for complete record)
+	for _, field := range s.Fields {
+		val, ok := rec[field.Name]
+		if !ok {
+			return nil, fmt.Errorf("missing field: %s", field.Name)
+		}
+
+		if err := writeFieldValue(buf, field.Type, val); err != nil {
+			return nil, err
+		}
+	}
+
+	return buf.Bytes(), nil
+}
+
+func (s *Schema) DeserializeRecord(data []byte) (uint64, Record, error) {
+	r := bytes.NewReader(data)
+
+	// read key
+	var key uint64
+	if err := binary.Read(r, binary.LittleEndian, &key); err != nil {
+		return 0, nil, err
+	}
+
+	// read all fields
+	rec := make(Record)
+	for _, field := range s.Fields {
+		val, err := readFieldValue(r, field.Type)
+		if err != nil {
+			return 0, nil, err
+		}
+		rec[field.Name] = val
+	}
+
+	return key, rec, nil
+}
+
 type Record map[string]any
+
+func writeFieldValue(w io.Writer, fieldType FieldType, value any) error {
+	switch fieldType {
+	case IntType:
+		v := value.(int32)
+		return encoding.WriteUint32(w, uint32(v))
+	case StringType:
+		s := value.(string)
+		return encoding.WriteString(w, s)
+	case BoolType:
+		b := value.(bool)
+		if b {
+			_, err := w.Write([]byte{1})
+			return err
+		}
+		_, err := w.Write([]byte{0})
+		return err
+	case FloatType:
+		f := value.(float64)
+		return encoding.WriteFloat64(w, f)
+	default:
+		return fmt.Errorf("unsupported type: %v", fieldType)
+	}
+}
+
+func readFieldValue(r io.Reader, fieldType FieldType) (any, error) {
+	switch fieldType {
+	case IntType:
+		val, err := encoding.ReadUint32(r)
+		return int32(val), err
+	case StringType:
+		return encoding.ReadString(r)
+	case BoolType:
+		buf := make([]byte, 1)
+		_, err := r.Read(buf)
+		return buf[0] != 0, err
+	case FloatType:
+		return encoding.ReadFloat64(r)
+	default:
+		return nil, fmt.Errorf("unsupported type: %v", fieldType)
+	}
+}

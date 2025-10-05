@@ -1,9 +1,16 @@
-2025/10/03 18:56:17 TCP server listening on [::]:42069
-2025/10/03 18:56:20 Client connected: [::1]:55102
-2025/10/03 18:56:34 Received: use restaurants
-2025/10/03 18:56:35 Received: select
-2025/10/03 18:56:38 Received: .exit
-2025/10/03 18:56:38 Scanner error: read tcp [::1]:42069->[::1]:55102: use of closed network connection
-2025/10/03 18:56:38 Client disconnected: [::1]:55102
-2025/10/03 18:56:49 Client connected: [::1]:55104
-2025/10/03 18:56:51 Received: select
+2025/10/03 19:00:29 TCP server listening on [::]:42069
+2025/10/03 19:00:53 Client connected: [::1]:55154
+2025/10/03 19:00:56 Received: select
+2025/10/03 19:01:03 Received: insert 3 canelo 12.5 false
+2025/10/03 19:01:13 Received: .exit
+2025/10/03 19:01:13 Scanner error: read tcp [::1]:42069->[::1]:55154: use of closed network connection
+2025/10/03 19:01:13 Client disconnected: [::1]:55154
+2025/10/04 07:13:26 Client connected: [::1]:57578
+2025/10/04 07:13:29 Received: show
+2025/10/04 07:13:31 Received: select
+2025/10/04 07:13:36 Received: use benchpress
+2025/10/04 07:13:37 Received: select
+2025/10/04 07:13:43 Received: use restaurants
+2025/10/04 07:13:44 Received: select
+2025/10/04 07:14:10 Received: insert 4 wildginger 81.7 true
+2025/10/04 07:14:11 Received: select

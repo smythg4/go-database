@@ -17,11 +17,17 @@ A handrolled database implementation in Go, built from scratch as a learning pro
 # Build the database
 go build -o godb cmd/main.go
 
-# Run the server
+# Run the server (logs go to stderr)
 ./godb
 
 # In another terminal, connect via TCP
 nc localhost 42069
+
+# Run tests
+go test ./...
+
+# Run specific B-tree tests
+go test -v -run TestLeafSplit page_test.go page.go disk_manager.go header.go
 ```
 
 ## Example Usage
@@ -127,14 +133,14 @@ Example hexdump of `products.db`:
 00000040: 6f70 d7a3 703d 0a8f 40c0 3200 0000       op..p=..@.2...
 ```
 
-## Known Limitations
+## Known Limitations (Current Append-Only Storage)
 
 - **File descriptor sharing**: Concurrent writes under heavy load may cause corruption (shared `os.File` handle not thread-safe)
 - **Map iteration randomness**: SELECT results may appear in different order each time (Go map iteration is deliberately randomized)
 - **No file closing**: Files remain open for program lifetime (OS cleans up on exit)
 - **O(n) scans**: Full table scans required for all queries (no indexing yet)
 
-These are accepted limitations of the append-only log design. The planned migration to B-tree page-based storage will address all of them.
+**Note**: These are accepted limitations of the current append-only log design. The in-progress B-tree page-based storage will address all of them.
 
 ## Learning Resources
 
@@ -143,14 +149,31 @@ This project follows concepts from:
 - **"Introduction to Algorithms" (CLRS)** - B-tree algorithms
 - **"Building a Database from Scratch in Go" by James Smith** - Initial inspiration
 
-## Future Development
+## Current Development: B-Tree Storage Engine
 
-Planned transition to B-tree page-based storage:
-- Fixed 4KB pages with slotted page layout
-- Page-level locking for proper concurrent access
-- Buffer pool for page caching
+The database is actively being migrated from append-only logs to a B-tree page-based storage engine:
+
+**✅ Completed:**
+- Slotted page layout (4KB fixed pages with headers, slot arrays, and variable-length records)
+- Binary search for sorted insertion and lookup
+- Leaf node splits with promoted key handling
+- Internal node splits with child pointer management
+- Page-level disk I/O with serialization
+- Table header with PageID allocation tracking
+- Comprehensive test suite (TestLeafSplit, TestInternalSplit, round-trip tests)
+
+**🚧 In Progress:**
+- BTree struct to orchestrate recursive insertion with split propagation
+- Root split handling (creates new root when root overflows)
+- Tree traversal for search operations
+- Integration with existing CLI and schema system
+
+**📋 Planned:**
+- Buffer pool for page caching in memory
+- Replace TableStore with B-tree backend
 - O(log n) lookups instead of O(n) scans
 - Sorted iteration and range queries
+- Node merging/rebalancing (optimization, lower priority)
 
 ## Project Goals
 

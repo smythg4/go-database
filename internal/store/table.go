@@ -3,9 +3,9 @@ package store
 import (
 	"encoding/binary"
 	"fmt"
+	"godb/internal/encoding"
 	"godb/internal/schema"
 	"io"
-	"math"
 	"os"
 	"sync"
 )
@@ -99,7 +99,7 @@ func (ts *TableStore) ReadSchema() (schema.Schema, error) {
 	}
 
 	// read the name of the table
-	name, err := readString(ts.File)
+	name, err := encoding.ReadString(ts.File)
 	if err != nil {
 		return schema.Schema{}, err
 	}
@@ -130,19 +130,19 @@ func (ts *TableStore) ReadSchema() (schema.Schema, error) {
 func (ts *TableStore) WriteSchema() error {
 	// write the table metadata
 	// table name data
-	if err := writeString(ts.File, ts.Schema.TableName); err != nil {
+	if err := encoding.WriteString(ts.File, ts.Schema.TableName); err != nil {
 		return err
 	}
 
 	// write number of fields
-	if err := writeUint32(ts.File, uint32(len(ts.Schema.Fields))); err != nil {
+	if err := encoding.WriteUint32(ts.File, uint32(len(ts.Schema.Fields))); err != nil {
 		return err
 	}
 
 	// write schema field breakdowns
 	for _, field := range ts.Schema.Fields {
 		// field name
-		if err := writeString(ts.File, field.Name); err != nil {
+		if err := encoding.WriteString(ts.File, field.Name); err != nil {
 			return err
 		}
 		// field type
@@ -222,54 +222,6 @@ func (ts *TableStore) ScanAll() ([]schema.Record, error) {
 	}
 }
 
-func writeUint32(w io.Writer, v uint32) error {
-	buf := make([]byte, 4)
-	binary.LittleEndian.PutUint32(buf, v)
-	_, err := w.Write(buf)
-	return err
-}
-
-func writeFloat64(w io.Writer, v float64) error {
-	buf := make([]byte, 8)
-	binary.LittleEndian.PutUint64(buf, math.Float64bits(v))
-	_, err := w.Write(buf)
-	return err
-}
-
-func writeString(w io.Writer, s string) error {
-	if err := writeUint32(w, uint32(len(s))); err != nil {
-		return err
-	}
-	_, err := w.Write([]byte(s))
-	return err
-}
-
-func readFloat64(r io.Reader) (float64, error) {
-	buf := make([]byte, 8)
-	if _, err := io.ReadFull(r, buf); err != nil {
-		return 0, err
-	}
-	bits := binary.LittleEndian.Uint64(buf)
-	return math.Float64frombits(bits), nil
-}
-
-func readString(r io.Reader) (string, error) {
-	lenBytes := make([]byte, 4)
-	_, err := io.ReadFull(r, lenBytes)
-	if err != nil {
-		return "", err
-	}
-	nameLength := binary.LittleEndian.Uint32(lenBytes)
-
-	nameBytes := make([]byte, nameLength)
-	_, err = io.ReadFull(r, nameBytes)
-	if err != nil {
-		return "", err
-	}
-
-	return string(nameBytes), nil
-}
-
 func readField(r io.Reader) (schema.Field, error) {
 	lenBytes := make([]byte, 4)
 	_, err := io.ReadFull(r, lenBytes)
@@ -302,10 +254,10 @@ func writeValue(w io.Writer, fieldType schema.FieldType, value any) error {
 	switch fieldType {
 	case schema.IntType:
 		v := value.(int32)
-		return writeUint32(w, uint32(v))
+		return encoding.WriteUint32(w, uint32(v))
 	case schema.StringType:
 		s := value.(string)
-		return writeString(w, s)
+		return encoding.WriteString(w, s)
 	case schema.BoolType:
 		b := value.(bool)
 		if b {
@@ -317,7 +269,7 @@ func writeValue(w io.Writer, fieldType schema.FieldType, value any) error {
 		}
 	case schema.FloatType:
 		f := value.(float64)
-		return writeFloat64(w, f)
+		return encoding.WriteFloat64(w, f)
 	default:
 		return fmt.Errorf("unsupported type: %v", fieldType)
 	}
@@ -332,7 +284,7 @@ func readValue(r io.Reader, fieldType schema.FieldType) (any, error) {
 		}
 		return int32(binary.LittleEndian.Uint32(buf)), nil
 	case schema.StringType:
-		return readString(r)
+		return encoding.ReadString(r)
 	case schema.BoolType:
 		buf := make([]byte, 1)
 		if _, err := io.ReadFull(r, buf); err != nil {
@@ -340,7 +292,7 @@ func readValue(r io.Reader, fieldType schema.FieldType) (any, error) {
 		}
 		return buf[0] != 0, nil
 	case schema.FloatType:
-		return readFloat64(r)
+		return encoding.ReadFloat64(r)
 	default:
 		return nil, fmt.Errorf("unsupported type: %v", fieldType)
 	}
