@@ -381,3 +381,47 @@ func TestSearchAfterSplit(t *testing.T) {
 	}
 	t.Logf("Deserialized: key=%d, rec=%v", key, rec)
 }
+
+func TestRangeScan(t *testing.T) {
+	bt, _, cleanup := createTestBTree(t)
+	defer cleanup()
+
+	sch := createTestSchema()
+
+	// Insert many records to trigger splits and create sibling chain
+	for i := 1; i <= 100; i++ {
+		rec := schema.Record{
+			"id":          int32(i * 10),
+			"description": "this_is_a_much_longer_product_description_to_fill_pages",
+			"qty":         int32(i),
+			"price":       float64(i) * 1.5,
+		}
+		data, _ := sch.SerializeRecord(rec)
+		bt.Insert(uint64(i*10), data)
+	}
+
+	// Range scan from 200 to 500
+	results, err := bt.RangeScan(200, 500)
+	if err != nil {
+		t.Fatalf("RangeScan failed: %v", err)
+	}
+
+	// Should find keys: 200, 210, 220, ..., 490, 500 = 31 keys
+	expected := 31
+	if len(results) != expected {
+		t.Errorf("Expected %d results, got %d", expected, len(results))
+	}
+
+	// Verify first and last
+	key0, _, _ := sch.DeserializeRecord(results[0])
+	if key0 != 200 {
+		t.Errorf("First key should be 200, got %d", key0)
+	}
+
+	keyLast, _, _ := sch.DeserializeRecord(results[len(results)-1])
+	if keyLast != 500 {
+		t.Errorf("Last key should be 500, got %d", keyLast)
+	}
+
+	t.Logf("Range scan found %d records from %d to %d", len(results), key0, keyLast)
+}

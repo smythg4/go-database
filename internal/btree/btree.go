@@ -232,23 +232,27 @@ func (bt *BTree) Search(key uint64) ([]byte, bool, error) {
 }
 
 func (bt *BTree) RangeScan(startKey, endKey uint64) ([][]byte, error) {
-	var result [][]byte
-
 	// start at the leaf containing startKey
 	leafPageID, _ := bt.findLeaf(startKey, &BTStack{})
-	leaf, _ := bt.loadNode(leafPageID)
 
-	for i := 0; i < int(leaf.NumSlots); i++ {
-		key := leaf.GetKey(i)
-		if key >= startKey && key <= endKey {
-			data, _ := leaf.GetRecord(i)
-			result = append(result, data)
-		} else if key > endKey {
-			break
+	var results [][]byte
+	for leafPageID != 0 { // 0 = end of the line
+		leaf, _ := bt.loadNode(leafPageID)
+		for i := 0; i < int(leaf.NumSlots); i++ {
+			key := leaf.GetKey(i)
+			if key >= startKey && key <= endKey {
+				data, _ := leaf.GetRecord(i)
+				results = append(results, data)
+			} else if key > endKey {
+				// break out of both loops, we're done
+				leafPageID = 0
+				break
+			}
 		}
+		leafPageID = leaf.NextLeaf
 	}
 	// this is incomplete! We're only scanning a single page. We need sibling pointers to neighbor leaves
-	return result, nil
+	return results, nil
 }
 
 type BNode struct {

@@ -46,45 +46,62 @@ A handrolled database implementation in Go with multi-client TCP server support,
 - Dynamic schema: INSERT/SELECT adapt to current table's field definitions
 - Formatted output: Column-aligned tables with field names as headers
 
-### B-Tree Page-Based Storage (In Development - `godatabase` package)
+### B+ Tree Storage Engine (`internal/pager` + `internal/btree`)
 
-**page.go** - Slotted page implementation for B-tree nodes:
-- `SlottedPage`: In-memory representation with header, slot array, and records
-  - Header: PageType (LEAF/INTERNAL), NumSlots, FreeSpacePtr, RightmostChild
-  - Slot array grows down from header, records grow up from end
+**Page Layer (`internal/pager/page.go`)** - Slotted page implementation:
+- `SlottedPage`: In-memory representation with 13-byte header, slot array, and records
+  - Header: PageType (LEAF/INTERNAL), NumSlots, FreeSpacePtr, RightmostChild, NextLeaf
+  - NextLeaf forms sibling chain for efficient range scans (B+ tree feature)
+  - Slot array grows down from byte 13, records grow up from end
   - 4KB fixed page size (PAGE_SIZE = 4096)
-- `Page`: Raw disk representation ([4096]byte array)
 - Key methods:
   - `InsertRecordSorted`: Binary search insertion maintaining key order
   - `Search`: Binary search for exact key match in leaf nodes
   - `SearchInternal`: Routes search to correct child page in internal nodes
-  - `SplitLeaf/SplitInternal`: Node splitting with promoted key handling
+  - `SplitLeaf/SplitInternal`: Node splitting with promoted key handling and child pointer updates
   - `Compact`: Removes deleted record gaps by repacking active records
-  - `Serialize/Deserialize`: Convert between in-memory and disk representations
+  - `Serialize/Deserialize`: Convert between in-memory (13-byte header) and disk ([4096]byte array)
 - Record formats:
   - Leaf: [key: 8 bytes][full record data: variable]
   - Internal: [key: 8 bytes][child PageID: 4 bytes]
-- First field in schema is always the key (stored as first 8 bytes of record)
+- First field in schema is always the key
 
-**header.go** - Table metadata for B-tree storage:
-- `TableHeader`: Magic number ("GDBT"), version, RootPageID, NextPageID, NumPages, Schema
+**Table Metadata (`internal/pager/header.go`)**:
+- `TableHeader`: Magic ("GDBT"), version, RootPageID, NextPageID, NumPages, Schema
 - Page 0 reserved for header (padded to 4KB), B-tree nodes start at page 1
 - NextPageID tracks next available page for allocation during splits
+- Written on every Insert via defer to maintain durability
 
-**disk_manager.go** - Page-level I/O:
-- `ReadPage/WritePage`: Load/store raw Page at calculated offset (pageID * PAGE_SIZE)
+**Disk I/O (`internal/pager/disk_manager.go`)**:
+- `ReadPage/WritePage`: Load/store raw Page at offset (pageID * PAGE_SIZE)
 - `ReadSlottedPage/WriteSlottedPage`: High-level wrappers with serialization
 - `ReadHeader/WriteHeader`: Table metadata at offset 0
 
-**page_test.go** - Comprehensive test suite:
-- Round-trip serialization tests
-- Sorted insertion verification
-- Leaf and internal node split tests with child pointer validation
-- Full disk I/O integration tests
+**B-Tree Orchestration (`internal/btree/btree.go`)**:
+- `BTree`: Manages tree structure via DiskManager and TableHeader
+- `BNode`: Thin wrapper around SlottedPage for tree-specific operations
+- Key algorithms:
+  - `Insert`: Uses breadcrumb stack to track descent path, handles splits bottom-up
+  - `propagateSplit`: Inserts promoted keys into parents, cascades splits up tree
+  - `handleRootSplit`: Creates new internal root when root overflows (tree height growth)
+  - `Search`: Descends tree using SearchInternal/Search, max depth check prevents infinite loops
+  - `RangeScan`: Follows NextLeaf sibling chain for efficient range queries
+- Breadcrumb stack pattern (from Petrov): Tracks PageID path during descent for split propagation
+- Child pointer management: After inserting promoted key at position i, updates record[i+1] or RightmostChild
 
-**btree.go** + **memory_disk.go** - Legacy CLRS-based implementation:
-- Original B-tree scaffolding, not currently integrated with new page system
-- Will be refactored to use SlottedPage infrastructure
+**Critical Implementation Details:**
+- Split propagation updates child pointers: When `[key, leftPageID]` inserted at index i, the next record (i+1) must point to rightPageID, or RightmostChild if last
+- Sibling chain maintenance: During SplitLeaf, `newPage.NextLeaf = oldPage.NextLeaf` then `oldPage.NextLeaf = newPageID`
+- Header durability: `defer dm.WriteHeader()` at start of Insert ensures PageID allocation persists
+- Search safety: Max depth 100 prevents infinite loops from corrupted page structures
+
+**Test Coverage (`internal/btree/btree_test.go` + `internal/pager/page_test.go`)**:
+- Insert without split (single leaf)
+- Insert with root split (tree height 1 → 2)
+- Search in single-level and multi-level trees
+- Range scan across multiple leaves via sibling pointers
+- Page serialization round-trips
+- Split mechanics (leaf/internal with child pointer validation)
 
 ## Development Commands
 

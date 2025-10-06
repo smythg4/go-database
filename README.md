@@ -149,31 +149,35 @@ This project follows concepts from:
 - **"Introduction to Algorithms" (CLRS)** - B-tree algorithms
 - **"Building a Database from Scratch in Go" by James Smith** - Initial inspiration
 
-## Current Development: B-Tree Storage Engine
+## B+ Tree Storage Engine
 
-The database is actively being migrated from append-only logs to a B-tree page-based storage engine:
+A fully functional B+ tree implementation is complete and tested:
 
 **✅ Completed:**
-- Slotted page layout (4KB fixed pages with headers, slot arrays, and variable-length records)
+- **Slotted page layout** - 4KB fixed pages with 13-byte headers, slot arrays, and variable-length records
+- **Page-level disk I/O** - Binary serialization with LittleEndian encoding
+- **Leaf node splits** - Promoted key handling with sibling pointer maintenance
+- **Internal node splits** - Child pointer management and cascading split propagation
+- **Root split handling** - Dynamic tree height growth when root overflows
+- **Insert operation** - O(log n) insertion with automatic splitting and rebalancing
+- **Search operation** - O(log n) point queries with multi-level tree traversal
+- **RangeScan operation** - O(log n + k) range queries using sibling pointer chain
+- **Table header** - PageID allocation tracking with durable persistence
+- **Comprehensive test suite** - TestInsertNoSplit, TestInsertWithRootSplit, TestSearch, TestSearchAfterSplit, TestRangeScan
+
+**Key Features:**
 - Binary search for sorted insertion and lookup
-- Leaf node splits with promoted key handling
-- Internal node splits with child pointer management
-- Page-level disk I/O with serialization
-- Table header with PageID allocation tracking
-- Comprehensive test suite (TestLeafSplit, TestInternalSplit, round-trip tests)
+- Breadcrumb stack pattern for bottom-up split propagation
+- Sibling pointers linking leaf nodes for efficient range scans
+- Max depth safety checks to prevent infinite loops
+- Critical child pointer updates after split operations
 
-**🚧 In Progress:**
-- BTree struct to orchestrate recursive insertion with split propagation
-- Root split handling (creates new root when root overflows)
-- Tree traversal for search operations
-- Integration with existing CLI and schema system
-
-**📋 Planned:**
-- Buffer pool for page caching in memory
-- Replace TableStore with B-tree backend
-- O(log n) lookups instead of O(n) scans
-- Sorted iteration and range queries
-- Node merging/rebalancing (optimization, lower priority)
+**📋 Next Steps:**
+- Integrate B+ tree with existing CLI (replace append-only TableStore)
+- Implement Delete operation with node merging/rebalancing
+- Add buffer pool for page caching in memory
+- Update command handlers to use B-tree backend
+- O(log n) lookups replacing current O(n) scans
 
 ## Project Goals
 

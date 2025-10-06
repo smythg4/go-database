@@ -22,6 +22,7 @@ type SlottedPage struct {
 	NumSlots       uint16
 	FreeSpacePtr   uint16
 	RightmostChild PageID   // only used on INTERNAL pages
+	NextLeaf       PageID   // used to navigate to neighbor leaf nodes
 	Slots          []Slot   // pointers to data records
 	Records        [][]byte // Raw record data
 }
@@ -46,10 +47,11 @@ func (sp *SlottedPage) Serialize() Page {
 	binary.LittleEndian.PutUint16(page.Data[1:3], sp.NumSlots)
 	binary.LittleEndian.PutUint16(page.Data[3:5], sp.FreeSpacePtr)
 	binary.LittleEndian.PutUint32(page.Data[5:9], uint32(sp.RightmostChild))
+	binary.LittleEndian.PutUint32(page.Data[9:13], uint32(sp.NextLeaf))
 
 	// write slot array
 	for i, slot := range sp.Slots {
-		offset := 9 + (i * 4)
+		offset := 13 + (i * 4)
 		binary.LittleEndian.PutUint16(page.Data[offset:offset+2], slot.Offset)
 		binary.LittleEndian.PutUint16(page.Data[offset+2:offset+4], slot.Length)
 	}
@@ -71,12 +73,13 @@ func DeserializeSlottedPage(page Page) (*SlottedPage, error) {
 		NumSlots:       binary.LittleEndian.Uint16(page.Data[1:3]),
 		FreeSpacePtr:   binary.LittleEndian.Uint16(page.Data[3:5]),
 		RightmostChild: PageID(binary.LittleEndian.Uint32(page.Data[5:9])),
+		NextLeaf:       PageID(binary.LittleEndian.Uint32(page.Data[9:13])),
 	}
 
 	// read slots
 	sp.Slots = make([]Slot, sp.NumSlots)
 	for i := 0; i < int(sp.NumSlots); i++ {
-		offset := 9 + (i * 4)
+		offset := 13 + (i * 4)
 		sp.Slots[i].Offset = binary.LittleEndian.Uint16(page.Data[offset : offset+2])
 		sp.Slots[i].Length = binary.LittleEndian.Uint16(page.Data[offset+2 : offset+4])
 	}
@@ -111,7 +114,7 @@ func (sp *SlottedPage) InsertRecordSorted(data []byte) (int, error) {
 
 	insertPos := sp.findInsertionPosition(key)
 
-	slotArrayEnd := 9 + (len(sp.Slots)+1)*4
+	slotArrayEnd := 13 + (len(sp.Slots)+1)*4
 	newFreePtr := sp.FreeSpacePtr - uint16(len(data))
 
 	if newFreePtr < uint16(slotArrayEnd) {
@@ -132,7 +135,7 @@ func (sp *SlottedPage) InsertRecordSorted(data []byte) (int, error) {
 }
 
 func (sp *SlottedPage) InsertRecord(data []byte) (int, error) {
-	slotArrayEnd := 9 + (len(sp.Slots)+1)*4
+	slotArrayEnd := 13 + (len(sp.Slots)+1)*4
 	newFreePtr := sp.FreeSpacePtr - uint16(len(data))
 
 	if newFreePtr < uint16(slotArrayEnd) {
@@ -287,6 +290,10 @@ func (sp *SlottedPage) SplitLeaf(newPageID PageID) (*SlottedPage, uint64, error)
 	sp.Compact()
 
 	promotedKey := newPage.GetKey(0)
+
+	// update sibling pointers
+	newPage.NextLeaf = sp.NextLeaf // new "right node" points to the original node's neighbor
+	sp.NextLeaf = newPageID        // new "left node" points to the new right node
 
 	return newPage, promotedKey, nil
 }
