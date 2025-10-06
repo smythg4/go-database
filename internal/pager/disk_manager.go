@@ -7,6 +7,14 @@ type DiskManager struct {
 	header TableHeader
 }
 
+func (dm *DiskManager) SetFile(file *os.File) {
+	dm.file = file
+}
+
+func (dm *DiskManager) SetHeader(h TableHeader) {
+	dm.header = h
+}
+
 func (dm *DiskManager) ReadHeader() error {
 	data := make([]byte, PAGE_SIZE)
 	_, err := dm.file.ReadAt(data, 0)

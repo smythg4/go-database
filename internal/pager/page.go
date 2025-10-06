@@ -197,7 +197,7 @@ func (sp *SlottedPage) findInsertionPosition(key uint64) int {
 	return left
 }
 
-func (sp *SlottedPage) SearchInternal(key uint64) PageID {
+func (sp *SlottedPage) SearchInternal(key uint64) (PageID, int) {
 	left, right := 0, len(sp.Records)
 	for left < right {
 		mid := (left + right) / 2
@@ -209,11 +209,11 @@ func (sp *SlottedPage) SearchInternal(key uint64) PageID {
 		}
 	}
 	if left >= len(sp.Records) {
-		return sp.RightmostChild
+		return sp.RightmostChild, -1
 	}
 
 	_, childPageID := DeserializeInternalRecord(sp.Records[left])
-	return childPageID
+	return childPageID, left
 }
 
 func (sp *SlottedPage) Search(key uint64) (int, bool) {
