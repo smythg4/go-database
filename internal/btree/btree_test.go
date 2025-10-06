@@ -56,7 +56,7 @@ func TestInsertNoSplit(t *testing.T) {
 	// Create BTree
 	bt := &BTree{
 		dm:     dm,
-		header: &header,
+		Header: &header,
 	}
 
 	// Insert 3 records (should not trigger split)
@@ -84,8 +84,8 @@ func TestInsertNoSplit(t *testing.T) {
 	}
 
 	// Verify root is still page 1 (no split)
-	if bt.header.RootPageID != 1 {
-		t.Errorf("Root should still be page 1, got %d", bt.header.RootPageID)
+	if bt.Header.RootPageID != 1 {
+		t.Errorf("Root should still be page 1, got %d", bt.Header.RootPageID)
 	}
 
 	// Verify records are in the root
@@ -157,7 +157,7 @@ func TestInsertWithRootSplit(t *testing.T) {
 	// Create BTree
 	bt := &BTree{
 		dm:     dm,
-		header: &header,
+		Header: &header,
 	}
 
 	// Insert many records to trigger split
@@ -182,20 +182,20 @@ func TestInsertWithRootSplit(t *testing.T) {
 		}
 
 		// Check if root changed (indicates split)
-		if bt.header.RootPageID != 1 {
+		if bt.Header.RootPageID != 1 {
 			t.Logf("Split occurred after inserting key %d", key)
-			t.Logf("New root is page %d", bt.header.RootPageID)
+			t.Logf("New root is page %d", bt.Header.RootPageID)
 			break
 		}
 	}
 
 	// Verify split occurred
-	if bt.header.RootPageID == 1 {
+	if bt.Header.RootPageID == 1 {
 		t.Skip("No split occurred with 100 records - may need more records or smaller page size")
 	}
 
 	// Verify new root is internal
-	newRoot, err := bt.loadNode(bt.header.RootPageID)
+	newRoot, err := bt.loadNode(bt.Header.RootPageID)
 	if err != nil {
 		t.Fatalf("loadNode failed: %v", err)
 	}
@@ -255,7 +255,7 @@ func createTestBTree(t *testing.T) (*BTree, *os.File, func()) {
 
 	bt := &BTree{
 		dm:     &dm,
-		header: &h,
+		Header: &h,
 	}
 
 	cleanup := func() {
@@ -350,13 +350,13 @@ func TestSearchAfterSplit(t *testing.T) {
 	}
 
 	// Verify split occurred
-	if bt.header.RootPageID == 1 {
+	if bt.Header.RootPageID == 1 {
 		t.Error("Expected root to split, but it's still page 1")
 	}
-	t.Logf("Root split occurred - new root is page %d", bt.header.RootPageID)
+	t.Logf("Root split occurred - new root is page %d", bt.Header.RootPageID)
 
 	// Verify root is internal
-	root, _ := bt.loadNode(bt.header.RootPageID)
+	root, _ := bt.loadNode(bt.Header.RootPageID)
 	if !root.IsLeaf() {
 		t.Logf("Root is internal node with %d keys", root.NumSlots)
 	}

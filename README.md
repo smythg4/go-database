@@ -26,8 +26,8 @@ nc localhost 42069
 # Run tests
 go test ./...
 
-# Run specific B-tree tests
-go test -v -run TestLeafSplit page_test.go page.go disk_manager.go header.go
+# Run B-tree tests specifically
+go test -v ./internal/btree
 ```
 
 ## Example Usage

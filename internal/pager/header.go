@@ -16,6 +16,17 @@ type TableHeader struct {
 	Schema     schema.Schema
 }
 
+func DefaultTableHeader(sch schema.Schema) TableHeader {
+	return TableHeader{
+		Magic:      [4]byte{'G', 'D', 'B', 'T'},
+		Version:    1,
+		RootPageID: 1,
+		NextPageID: 2,
+		NumPages:   1,
+		Schema:     sch,
+	}
+}
+
 func (th *TableHeader) Serialize() ([]byte, error) {
 	buf := new(bytes.Buffer)
 

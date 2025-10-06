@@ -32,7 +32,7 @@ func ProcessCommand(input string, config *cli.DatabaseConfig, w io.Writer) error
 func RunREPL(config *cli.DatabaseConfig) {
 	scanner := bufio.NewScanner(os.Stdin)
 	for {
-		fmt.Printf("Go-DB [%s]> ", config.TableS.Schema.TableName)
+		fmt.Printf("Go-DB [%s]> ", config.TableS.Schema().TableName)
 		scanner.Scan()
 		err := ProcessCommand(scanner.Text(), config, os.Stdout)
 		if err != nil {
@@ -52,7 +52,7 @@ func handleTCPConnection(conn net.Conn, baseConfig *cli.DatabaseConfig) {
 	writer := bufio.NewWriter(conn)
 	scanner := bufio.NewScanner(conn)
 
-	fmt.Fprintf(writer, "Go-DB [%s]> ", sessionConfig.TableS.Schema.TableName)
+	fmt.Fprintf(writer, "Go-DB [%s]> ", sessionConfig.TableS.Schema().TableName)
 	_ = writer.Flush()
 	for scanner.Scan() {
 		input := scanner.Text()
@@ -64,7 +64,7 @@ func handleTCPConnection(conn net.Conn, baseConfig *cli.DatabaseConfig) {
 		}
 
 		// send prompt for next command
-		fmt.Fprintf(writer, "\nGo-DB [%s]> ", sessionConfig.TableS.Schema.TableName)
+		fmt.Fprintf(writer, "\nGo-DB [%s]> ", sessionConfig.TableS.Schema().TableName)
 		writer.Flush()
 	}
 

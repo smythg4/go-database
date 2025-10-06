@@ -10,13 +10,25 @@ A handrolled database implementation in Go with multi-client TCP server support,
 
 ### Active Storage Layer (`internal/store`)
 
-**table.go** - Primary storage implementation using append-only log with deduplication:
+**btree_store.go** - Primary storage implementation using B+ tree (current backend):
+- `BTreeStore`: Thin wrapper around B+ tree with schema-aware operations
+- Implements same interface as legacy TableStore (Insert, Find, ScanAll)
+- `sync.RWMutex` for concurrent access protection (Insert uses Lock, Find/ScanAll use RLock)
+- Key methods:
+  - `Insert(record)`: Extracts first field as uint64 key, serializes record, calls bt.Insert
+  - `Find(id)`: Searches B+ tree via bt.Search, deserializes result
+  - `ScanAll()`: Full table scan via bt.RangeScan(0, MaxUint64), deserializes all records
+  - `Schema()`: Returns read-only schema from bt.Header.Schema
+  - `Stats()`: Exposes tree structure for debugging (root page, type, NextPageID)
+- Constructor helpers: `NewBTreeStore(filename)` opens existing, `CreateBTreeStore(filename, schema)` creates new
+- **Critical pattern**: Primary key (first field) must be int32, cast to uint64 for tree operations
+
+**table.go** - Legacy append-only log storage (replaced by BTreeStore):
 - `TableStore`: Schema-based table storage with binary serialization
 - File format: Schema header (table name, field definitions) + variable-length records
-- Supports int32, string, bool, and float64 types (IEEE 754 encoding via `math.Float64bits`)
-- `sync.RWMutex` for concurrent access protection (Insert uses Lock, Find/ScanAll use RLock)
-- Deduplication: `ScanAll()` returns latest record per ID, `Find(id)` scans entire file for most recent match
-- Helper functions: `writeValue/readValue` for type-aware serialization, `writeString/readString` for length-prefixed strings
+- Deduplication on read: `ScanAll()` returns latest record per ID
+- Helper functions: `writeValue/readValue` for type-aware serialization
+- **Status**: No longer used by CLI, kept for reference
 
 **kv.go** - Simple key-value storage (legacy, still used for testing):
 - Append-only int32 key-value pairs as 8-byte records
@@ -40,11 +52,12 @@ A handrolled database implementation in Go with multi-client TCP server support,
 - Per-session config: Each TCP client gets isolated `DatabaseConfig` but shares TableStore instances via cache
 
 **commands.go** - Command implementations:
-- Table cache: `GetOrOpenTable(filename)` ensures single TableStore instance per file (critical for mutex to work)
+- Table cache: `GetOrOpenTable(filename)` ensures single BTreeStore instance per file (critical for mutex to work)
 - Commands write to `io.Writer` parameter, return errors
-- SQL-like: `create`, `use`, `show`, `insert`, `select [id]`
+- SQL-like: `create`, `use`, `show`, `insert`, `select [id]`, `stats`
 - Dynamic schema: INSERT/SELECT adapt to current table's field definitions
 - Formatted output: Column-aligned tables with field names as headers
+- `stats` command: Shows tree structure (root page ID, type, NextPageID allocation)
 
 ### B+ Tree Storage Engine (`internal/pager` + `internal/btree`)
 
@@ -70,7 +83,8 @@ A handrolled database implementation in Go with multi-client TCP server support,
 - `TableHeader`: Magic ("GDBT"), version, RootPageID, NextPageID, NumPages, Schema
 - Page 0 reserved for header (padded to 4KB), B-tree nodes start at page 1
 - NextPageID tracks next available page for allocation during splits
-- Written on every Insert via defer to maintain durability
+- `DefaultTableHeader(schema)`: Helper for creating initial headers with schema
+- **Critical durability pattern**: BTree modifies its own header copy (RootPageID/NextPageID), must sync back to DiskManager before WriteHeader
 
 **Disk I/O (`internal/pager/disk_manager.go`)**:
 - `ReadPage/WritePage`: Load/store raw Page at offset (pageID * PAGE_SIZE)
@@ -80,20 +94,24 @@ A handrolled database implementation in Go with multi-client TCP server support,
 **B-Tree Orchestration (`internal/btree/btree.go`)**:
 - `BTree`: Manages tree structure via DiskManager and TableHeader
 - `BNode`: Thin wrapper around SlottedPage for tree-specific operations
+- `NewBTree(dm, header)`: Constructor for creating BTree with unexported fields
 - Key algorithms:
   - `Insert`: Uses breadcrumb stack to track descent path, handles splits bottom-up
+    - **Critical**: Defer pattern syncs header back to DM: `defer func() { bt.dm.SetHeader(*bt.Header); bt.dm.WriteHeader() }()`
   - `propagateSplit`: Inserts promoted keys into parents, cascades splits up tree
   - `handleRootSplit`: Creates new internal root when root overflows (tree height growth)
   - `Search`: Descends tree using SearchInternal/Search, max depth check prevents infinite loops
   - `RangeScan`: Follows NextLeaf sibling chain for efficient range queries
+  - `Stats()`: Debug helper showing root page ID, type, NextPageID allocation
 - Breadcrumb stack pattern (from Petrov): Tracks PageID path during descent for split propagation
 - Child pointer management: After inserting promoted key at position i, updates record[i+1] or RightmostChild
 
 **Critical Implementation Details:**
 - Split propagation updates child pointers: When `[key, leftPageID]` inserted at index i, the next record (i+1) must point to rightPageID, or RightmostChild if last
 - Sibling chain maintenance: During SplitLeaf, `newPage.NextLeaf = oldPage.NextLeaf` then `oldPage.NextLeaf = newPageID`
-- Header durability: `defer dm.WriteHeader()` at start of Insert ensures PageID allocation persists
+- **Header durability bug fix**: BTree modifies its own header copy (RootPageID, NextPageID), but DiskManager holds original. Must call `bt.dm.SetHeader(*bt.Header)` before `bt.dm.WriteHeader()` to sync changes. Implemented as defer at start of Insert.
 - Search safety: Max depth 100 prevents infinite loops from corrupted page structures
+- Primary key constraint: First field in schema must be int32 (cast to uint64 for key operations)
 
 **Test Coverage (`internal/btree/btree_test.go` + `internal/pager/page_test.go`)**:
 - Insert without split (single leaf)
@@ -102,6 +120,7 @@ A handrolled database implementation in Go with multi-client TCP server support,
 - Range scan across multiple leaves via sibling pointers
 - Page serialization round-trips
 - Split mechanics (leaf/internal with child pointer validation)
+- **Integration testing**: Stress test with 150 inserts verified multi-level tree growth (root split from page 1 → page 3)
 
 ## Development Commands
 
@@ -122,11 +141,14 @@ go vet ./...
 # Run all tests
 go test ./...
 
-# Run specific test
-go test -v -run TestLeafSplit
+# Run B-tree tests
+go test -v ./internal/btree/
 
-# Run page-related tests (requires multiple files)
-go test -v -run TestLeafSplit page_test.go page.go disk_manager.go header.go
+# Run specific test
+go test -v -run TestInsertWithRootSplit ./internal/btree/
+
+# Run page-related tests
+go test -v ./internal/pager/
 ```
 
 ## Key Design Decisions
@@ -138,9 +160,9 @@ go test -v -run TestLeafSplit page_test.go page.go disk_manager.go header.go
 - Bools: Single byte (1=true, 0=false)
 
 **Concurrency Model:**
-- Table cache in `cli` package ensures single `TableStore` per file
-- `sync.RWMutex` on TableStore serializes file access
-- **Known limitation**: Shared `os.File` handle with concurrent Seek operations can cause corruption under heavy concurrent writes (file descriptor not thread-safe). Planned fix: per-operation file handles or move to page-based B-tree storage.
+- Table cache in `cli` package ensures single `BTreeStore` per file
+- `sync.RWMutex` on BTreeStore serializes tree access (Insert uses Lock, Find/ScanAll use RLock)
+- B+ tree storage provides better concurrency characteristics than legacy append-only log
 
 **Command Processing:**
 - Commands take `io.Writer` to support both stdout (REPL) and `net.Conn` (TCP)
@@ -148,22 +170,23 @@ go test -v -run TestLeafSplit page_test.go page.go disk_manager.go header.go
 - Per-session `DatabaseConfig` allows clients to switch tables independently
 
 **Schema System:**
-- Dynamic field parsing: Commands query `config.TableS.Schema.Fields` at runtime
+- Dynamic field parsing: Commands query `config.TableS.Schema().Fields` at runtime (method call, not field access)
 - Type parsing via switch statements in `schema.ParseValue`
-- Schema stored in file header, read on open (no external metadata files)
+- Schema stored in file header (page 0), read on open (no external metadata files)
+- **Primary key constraint**: First field must be int32 type (used as uint64 key in B+ tree)
 
 ## Important Implementation Details
 
-- `INSERT` deduplication happens on read (ScanAll/Find), not write - allows last-write-wins semantics
 - Schema field order is preserved during serialization (critical for binary format consistency)
 - Float parsing in Go: `strconv.ParseFloat(s, 64)` for user input
-- EOF handling: Break inner loop on first field EOF, then exit outer record-reading loop
-- Table names in prompts: Read from `TableStore.Schema.TableName` (file header), not filename
+- Table names in prompts: Read from `BTreeStore.Schema().TableName` (file header), not filename
 - Server logs go to stderr (`log.SetOutput(os.Stderr)`) to avoid REPL interference
+- Primary key extraction: `record[firstField.Name].(int32)` type assertion, cast to uint64 for tree key
+- Stats command useful for debugging tree structure: shows root page, type (LEAF=0/INTERNAL=1), NextPageID
 
 ## Current Development Status
 
-B-tree page-based storage is **in active development**:
+B+ tree page-based storage is **completed and fully integrated** with the CLI:
 
 **Completed:**
 - ✅ Slotted page layout with serialization/deserialization
@@ -173,15 +196,21 @@ B-tree page-based storage is **in active development**:
 - ✅ Page-level I/O with DiskManager
 - ✅ Table header with PageID allocation tracking
 - ✅ Comprehensive test suite for pages and splits
+- ✅ BTree orchestration with recursive insertion and split propagation
+- ✅ Root split handling (creates new root with 2 children)
+- ✅ Search implementation with tree traversal
+- ✅ Range scan with sibling pointer traversal
+- ✅ BTreeStore wrapper implementing TableStore interface
+- ✅ Full CLI integration (create, use, insert, select, stats commands)
+- ✅ Header durability fix (sync BTree changes back to DiskManager)
+- ✅ Stress testing with 150 inserts verified multi-level tree growth
 
-**Next Steps:**
-- BTree struct to orchestrate recursive insertion with split propagation
-- Root split handling (creates new root with 2 children)
-- Search implementation with tree traversal
-- Integration with existing CLI/schema system
-- Node merging/rebalancing (optional optimization, can defer)
-- Buffer pool for page caching
-- Replace append-only TableStore with B-tree backend
+**Future Enhancements (not urgent):**
+- Node merging/rebalancing after deletions
+- Buffer pool for page caching (reduce disk I/O)
+- Support non-int primary keys via hashing (currently first field must be int32)
+- Deletion operations (currently insert-only)
+- Transaction support with ACID guarantees
 
 ## Learning-Focused Interaction Guidelines
 
@@ -253,3 +282,4 @@ The user has experienced unproductive loops where:
 - Reading technical documentation (database papers, RFCs)
 
 The user learns best through guided exploration, not guided implementation.
+- note that for now the primary key (first field of schema) must be an int, but maybe we can hash it for a key value in the future that's a uint64

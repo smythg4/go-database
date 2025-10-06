@@ -15,26 +15,26 @@ import (
 
 var (
 	tableCacheMu sync.RWMutex
-	tableCache   = make(map[string]*store.TableStore)
+	tableCache   = make(map[string]*store.BTreeStore)
 )
 
-func GetOrOpenTable(filename string) (*store.TableStore, error) {
+func GetOrOpenTable(filename string) (*store.BTreeStore, error) {
 	tableCacheMu.Lock()
 	defer tableCacheMu.Unlock()
 
-	if ts, ok := tableCache[filename]; ok {
-		return ts, nil
+	if bts, ok := tableCache[filename]; ok {
+		return bts, nil
 	}
 
-	ts, err := store.NewTableStore(filename)
+	bts, err := store.NewBTreeStore(filename)
 	if err != nil {
 		return nil, err
 	}
-	tableCache[filename] = ts
-	return ts, nil
+	tableCache[filename] = bts
+	return bts, nil
 }
 
-func CreateTable(filename string, sch schema.Schema) (*store.TableStore, error) {
+func CreateTable(filename string, sch schema.Schema) (*store.BTreeStore, error) {
 	tableCacheMu.Lock()
 	defer tableCacheMu.Unlock()
 
@@ -42,7 +42,7 @@ func CreateTable(filename string, sch schema.Schema) (*store.TableStore, error) 
 		return nil, fmt.Errorf("table already open: %s", filename)
 	}
 
-	ts, err := store.CreateTableStore(filename, sch)
+	ts, err := store.CreateBTreeStore(filename, sch)
 	if err != nil {
 		return nil, err
 	}
@@ -52,7 +52,7 @@ func CreateTable(filename string, sch schema.Schema) (*store.TableStore, error) 
 }
 
 type DatabaseConfig struct {
-	TableS *store.TableStore
+	TableS *store.BTreeStore
 }
 
 type CliCommand struct {
@@ -100,7 +100,18 @@ func init() {
 			Description: "Create a new table -- CREATE tablename field1name:field1type field2name:field2type ...",
 			Callback:    commandCreate,
 		},
+		"stats": {
+			Name:        "stats",
+			Description: "Get additional information about the active table",
+			Callback:    commandStats,
+		},
 	}
+}
+
+func commandStats(config *DatabaseConfig, params []string, w io.Writer) error {
+	stats := config.TableS.Stats()
+	fmt.Fprintln(w, stats)
+	return nil
 }
 
 func commandCreate(config *DatabaseConfig, params []string, w io.Writer) error {
@@ -134,12 +145,12 @@ func commandCreate(config *DatabaseConfig, params []string, w io.Writer) error {
 		Fields:    fields,
 	}
 
-	newTableStore, err := CreateTable(fName, sch)
+	newTableStore, err := store.CreateBTreeStore(fName, sch)
 	if err != nil {
 		return err
 	}
 	config.TableS = newTableStore
-	fmt.Fprintf(w, "New table created: %s\n", newTableStore.Schema.TableName)
+	fmt.Fprintf(w, "New table created: %s\n", newTableStore.Schema().TableName)
 	return nil
 }
 
@@ -205,14 +216,14 @@ func commandExit(config *DatabaseConfig, params []string, w io.Writer) error {
 }
 
 func commandInsert(config *DatabaseConfig, params []string, w io.Writer) error {
-	fieldCount := len(config.TableS.Schema.Fields)
+	fieldCount := len(config.TableS.Schema().Fields)
 
 	if len(params) != fieldCount {
-		return fmt.Errorf("need %d parameters for fields: %v", fieldCount, config.TableS.Schema.GetFieldNames())
+		return fmt.Errorf("need %d parameters for fields: %v", fieldCount, config.TableS.Schema().GetFieldNames())
 	}
 
 	record := make(schema.Record)
-	for i, field := range config.TableS.Schema.Fields {
+	for i, field := range config.TableS.Schema().Fields {
 		// parse params[i] according to field.type
 		value, err := schema.ParseValue(params[i], field.Type)
 		if err != nil {
@@ -220,7 +231,7 @@ func commandInsert(config *DatabaseConfig, params []string, w io.Writer) error {
 		}
 		record[field.Name] = value
 	}
-	fmt.Fprintf(w, "Inserting %+v into table %s\n", record, config.TableS.Schema.TableName)
+	fmt.Fprintf(w, "Inserting %+v into table %s\n", record, config.TableS.Schema().TableName)
 	return config.TableS.Insert(record)
 }
 
@@ -230,7 +241,7 @@ func selectAll(config *DatabaseConfig, w io.Writer) error {
 		return err
 	}
 
-	fieldNames := config.TableS.Schema.GetFieldNames()
+	fieldNames := config.TableS.Schema().GetFieldNames()
 	widths := make([]int, len(fieldNames))
 	for i, field := range fieldNames {
 		widths[i] = len(field) * 4
@@ -244,7 +255,7 @@ func selectAll(config *DatabaseConfig, w io.Writer) error {
 
 	for _, record := range records {
 		fmt.Fprint(w, "| ")
-		for i, field := range config.TableS.Schema.Fields {
+		for i, field := range config.TableS.Schema().Fields {
 			val := fmt.Sprintf("%v", record[field.Name])
 			fmt.Fprintf(w, "%-*s | ", widths[i], val)
 		}
@@ -259,7 +270,7 @@ func commandSelect(config *DatabaseConfig, params []string, w io.Writer) error {
 		return selectAll(config, w)
 	}
 
-	fieldNames := config.TableS.Schema.GetFieldNames()
+	fieldNames := config.TableS.Schema().GetFieldNames()
 	widths := make([]int, len(fieldNames))
 	for i, field := range fieldNames {
 		widths[i] = len(field) * 4
@@ -279,7 +290,7 @@ func commandSelect(config *DatabaseConfig, params []string, w io.Writer) error {
 	record, err := config.TableS.Find(id)
 
 	fmt.Fprint(w, "| ")
-	for i, field := range config.TableS.Schema.Fields {
+	for i, field := range config.TableS.Schema().Fields {
 		val := fmt.Sprintf("%v", record[field.Name])
 		fmt.Fprintf(w, "%-*s | ", widths[i], val)
 	}

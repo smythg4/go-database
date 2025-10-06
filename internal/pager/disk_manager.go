@@ -15,6 +15,10 @@ func (dm *DiskManager) SetHeader(h TableHeader) {
 	dm.header = h
 }
 
+func (dm *DiskManager) GetHeader() *TableHeader {
+	return &dm.header
+}
+
 func (dm *DiskManager) ReadHeader() error {
 	data := make([]byte, PAGE_SIZE)
 	_, err := dm.file.ReadAt(data, 0)
@@ -38,7 +42,11 @@ func (dm *DiskManager) WriteHeader() error {
 	copy(padded, data)
 
 	_, err = dm.file.WriteAt(padded, 0)
-	return err
+	if err != nil {
+		return err
+	}
+	// ensure write to disk is completed
+	return dm.file.Sync()
 }
 
 func (dm *DiskManager) ReadPage(pageID PageID) (Page, error) {

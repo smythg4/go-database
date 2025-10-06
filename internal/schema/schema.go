@@ -70,7 +70,7 @@ type Schema struct {
 	Fields    []Field
 }
 
-func (s *Schema) GetFieldNames() []string {
+func (s Schema) GetFieldNames() []string {
 	names := make([]string, len(s.Fields))
 	for i, field := range s.Fields {
 		names[i] = field.Name

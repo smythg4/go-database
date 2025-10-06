@@ -8,7 +8,14 @@ import (
 
 type BTree struct {
 	dm     *pager.DiskManager
-	header *pager.TableHeader
+	Header *pager.TableHeader
+}
+
+func NewBTree(dm *pager.DiskManager, header *pager.TableHeader) *BTree {
+	return &BTree{
+		dm:     dm,
+		Header: header,
+	}
 }
 
 func (bt *BTree) loadNode(pageID pager.PageID) (*BNode, error) {
@@ -28,7 +35,7 @@ func (bn *BNode) IsLeaf() bool {
 }
 
 func (bt *BTree) findLeaf(key uint64, breadcrumbs *BTStack) (pager.PageID, error) {
-	currentPageID := bt.header.RootPageID
+	currentPageID := bt.Header.RootPageID
 	for {
 		node, err := bt.loadNode(currentPageID)
 		if err != nil {
@@ -48,8 +55,8 @@ func (bt *BTree) findLeaf(key uint64, breadcrumbs *BTStack) (pager.PageID, error
 
 func (bt *BTree) handleRootSplit(promotedKey uint64, leftChildID, rightChildID pager.PageID) error {
 	// allocate a page for the new root node
-	newRootID := bt.header.NextPageID
-	bt.header.NextPageID++
+	newRootID := bt.Header.NextPageID
+	bt.Header.NextPageID++
 	nsp := pager.NewSlottedPage(newRootID, pager.INTERNAL)
 	newRoot := &BNode{SlottedPage: nsp}
 
@@ -64,7 +71,7 @@ func (bt *BTree) handleRootSplit(promotedKey uint64, leftChildID, rightChildID p
 	// the new sibling from the split becomes the rightmostchild of the new root
 	newRoot.RightmostChild = rightChildID
 	// update tree header to point to new root
-	bt.header.RootPageID = newRootID
+	bt.Header.RootPageID = newRootID
 
 	// write the new root to the disk
 	return bt.writeNode(newRoot)
@@ -105,7 +112,7 @@ func (bt *BTree) propogateSplit(promotedKey uint64, rightPageID, leftPageID page
 		}
 
 		// page must have been full, now we split
-		rightNode, newPromotedKey, err := parent.splitNode(bt.header.NextPageID)
+		rightNode, newPromotedKey, err := parent.splitNode(bt.Header.NextPageID)
 		if err != nil {
 			return err
 		}
@@ -117,7 +124,7 @@ func (bt *BTree) propogateSplit(promotedKey uint64, rightPageID, leftPageID page
 		if err := bt.writeNode(rightNode); err != nil {
 			return err
 		}
-		bt.header.NextPageID++
+		bt.Header.NextPageID++
 
 		// update for the next iteration
 		// the parent that just split becomes the left child for the next level
@@ -133,7 +140,11 @@ func (bt *BTree) propogateSplit(promotedKey uint64, rightPageID, leftPageID page
 
 func (bt *BTree) Insert(key uint64, data []byte) error {
 	breadcrumbs := &BTStack{}
-	defer bt.dm.WriteHeader()
+	defer func() {
+		// we were writing stale headers. This will ensure that it's up to date before writing to the disk
+		bt.dm.SetHeader(*bt.Header)
+		bt.dm.WriteHeader()
+	}()
 
 	// traverse to leaf, collecting breadcrumbs
 	leafPageID, err := bt.findLeaf(key, breadcrumbs)
@@ -158,11 +169,11 @@ func (bt *BTree) Insert(key uint64, data []byte) error {
 	}
 
 	// page was full, time to split
-	rightNode, promotedKey, err := leaf.splitNode(bt.header.NextPageID)
+	rightNode, promotedKey, err := leaf.splitNode(bt.Header.NextPageID)
 	if err != nil {
 		return err
 	}
-	bt.header.NextPageID++
+	bt.Header.NextPageID++
 
 	// write both halves
 	if err := bt.writeNode(leaf); err != nil {
@@ -199,7 +210,7 @@ func (bt *BTree) Search(key uint64) ([]byte, bool, error) {
 	// safety net
 	maxDepth := 100
 
-	currentPageID := bt.header.RootPageID
+	currentPageID := bt.Header.RootPageID
 
 	// traverse down to leaf
 	for depth := 0; depth < maxDepth; depth++ {
@@ -309,4 +320,10 @@ func (bn *BNode) splitNode(newPageID pager.PageID) (*BNode, uint64, error) {
 	default:
 		return nil, 0, fmt.Errorf("invalid page type: %v", bn.PageType)
 	}
+}
+
+func (bt *BTree) Stats() string {
+	root, _ := bt.loadNode(bt.Header.RootPageID)
+	return fmt.Sprintf("Root: page %d, Type: %v, NextPageID: %d, NumPages: %d",
+		bt.Header.RootPageID, root.PageType, bt.Header.NextPageID, bt.Header.NumPages)
 }
