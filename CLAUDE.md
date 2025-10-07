@@ -55,12 +55,15 @@ A handrolled database implementation in Go with multi-client TCP server support,
 **commands.go** - Command implementations:
 - Table cache: `GetOrOpenTable(filename)` ensures single BTreeStore instance per file (critical for mutex to work)
 - Commands write to `io.Writer` parameter, return errors
-- SQL-like: `create`, `use`, `show`, `insert`, `select [id]`, `delete <id>`, `update <values>`, `stats`
+- SQL-like: `create`, `use`, `show`, `describe`, `insert`, `select [id] [start end]`, `update <values>`, `delete <id>`, `count [id] [start end]`, `drop <table>`, `stats`
 - Dynamic schema: INSERT/SELECT/UPDATE adapt to current table's field definitions
 - Formatted output: Column-aligned tables with field names as headers
-- `delete <id>`: Finds record by key, displays it, then calls Delete (with merge support)
+- **Range queries**: `select <start> <end>` and `count <start> <end>` use RangeScan for efficient range operations
+- **Schema introspection**: `describe` shows table structure with field types and primary key
+- `delete <id>`: Finds record by key, displays it, then calls Delete (triggers merges, updates free list)
 - `update <values>`: Naive implementation using DELETE + INSERT (shows record being updated)
-- `stats` command: Shows tree structure (root page ID, type, NextPageID allocation)
+- `drop <table>`: Removes .db file (includes graceful handling for non-existent files)
+- `stats` command: Shows tree structure (root page ID, type, NextPageID allocation, tree depth)
 
 ### B+ Tree Storage Engine (`internal/pager` + `internal/btree`)
 
@@ -87,22 +90,29 @@ A handrolled database implementation in Go with multi-client TCP server support,
 - First field in schema is always the key
 
 **Table Metadata (`internal/pager/header.go`)**:
-- `TableHeader`: Magic ("GDBT"), version, RootPageID, NextPageID, NumPages, Schema
+- `TableHeader`: Magic ("GDBT"), version, RootPageID, NextPageID, NumPages, Schema, FreePageIDs
 - Page 0 reserved for header (padded to 4KB), B-tree nodes start at page 1
 - NextPageID tracks next available page for allocation during splits
+- **FreePageIDs**: Slice of PageIDs freed during merges, reused before allocating new pages
 - `DefaultTableHeader(schema)`: Helper for creating initial headers with schema
-- **Critical durability pattern**: BTree modifies its own header copy (RootPageID/NextPageID), must sync back to DiskManager before WriteHeader
+- **Critical durability pattern**: BTree modifies its own header copy (RootPageID/NextPageID/FreePageIDs), must sync back to DiskManager before WriteHeader
+- **Serialization**: FreePageIDs serialized as uint32 count + array of PageIDs (4 bytes each)
 
 **Disk I/O (`internal/pager/disk_manager.go`)**:
 - `ReadPage/WritePage`: Load/store raw Page at offset (pageID * PAGE_SIZE)
 - `ReadSlottedPage/WriteSlottedPage`: High-level wrappers with serialization
 - `ReadHeader/WriteHeader`: Table metadata at offset 0 (WriteHeader calls Sync())
 - `Sync()`: Flushes OS buffers to disk (critical for durability)
+- **WritePage now calls Sync()**: Each page write is immediately flushed (performance cost, but ensures durability)
 
 **B-Tree Orchestration (`internal/btree/btree.go`)**:
 - `BTree`: Manages tree structure via DiskManager and TableHeader
 - `BNode`: Thin wrapper around SlottedPage for tree-specific operations
 - `NewBTree(dm, header)`: Constructor for creating BTree with unexported fields
+- **Free Page Management**:
+  - `allocatePage()`: Checks FreePageIDs slice, pops if available, otherwise increments NextPageID
+  - Merge operations append orphaned PageID to FreePageIDs slice
+  - **No mutex protection**: BTreeStore's RWMutex serializes all BTree access, so FreePageIDs is implicitly protected
 - Key algorithms:
   - `Insert`: Uses breadcrumb stack to track descent path, handles splits bottom-up
     - **Critical**: Defer pattern syncs header and calls Sync(): `defer func() { bt.dm.SetHeader(*bt.Header); bt.dm.WriteHeader(); bt.dm.Sync() }()`
@@ -166,6 +176,16 @@ go test -v -run TestInsertWithRootSplit ./internal/btree/
 
 # Run page-related tests
 go test -v ./internal/pager/
+
+# Benchmark B+Tree vs legacy storage
+go test -bench=. -benchmem ./internal/store/
+
+# Stress tests (require running server)
+./test_concurrent.sh   # 5000 concurrent inserts across 5 clients
+./test_chaos.sh        # Concurrent inserts + deletes (tests merges and free list)
+./test_freelist.sh     # Verifies free page reuse after chaos test
+./stress_test.sh       # 10000 sequential inserts
+./stress_delete.sh     # Delete many records (tests merge logic)
 ```
 
 ## Key Design Decisions
@@ -233,30 +253,38 @@ B+ tree page-based storage is **completed and fully integrated** with the CLI:
 - ✅ Parent pointer updates after DeleteRecord (slots shift down)
 - ✅ Recursive underflow propagation up the tree
 - ✅ Root collapse when internal root has only RightmostChild
-- ✅ Durability: `Sync()` after all DELETE operations
-- ✅ CLI: `delete <id>` and `update <values>` commands
+- ✅ Durability: `Sync()` in WritePage ensures all writes persist
+- ✅ CLI: `delete <id>`, `update <values>`, `count`, `describe`, `drop` commands
+- ✅ **Free page list**: Orphaned pages from merges added to FreePageIDs, reused on next allocatePage()
 
 **Critical Bugs Fixed:**
 - ✅ **Parent write before recursion**: Parent updates must be persisted BEFORE recursive underflow handling, otherwise stale parent pointers point to orphaned pages
 - ✅ **Leaf write before underflow check**: Modified leaf must be written to disk BEFORE checking underflow (same pattern as parent fix)
 - ✅ **Cycle detection in RangeScan**: Detects corrupted leaf chains that visit pages twice
-- ✅ **Missing fsync**: Added `DiskManager.Sync()` and called after Insert/Delete to flush OS buffers
+- ✅ **Catastrophic durability bug**: Pages written to OS buffer but never synced. Fixed by adding `Sync()` to `WritePage()`. Caught via stress testing with 5000 concurrent inserts.
 
 **Merge Algorithm Details:**
 - Prefers merging with left sibling (right into left) for consistency
 - Falls back to right sibling if no left sibling exists
-- Skips merge if combined size > PAGE_SIZE (accepts fragmentation in Phase 1)
-- **Leaf merge**: Updates NextLeaf chain (`merged.NextLeaf = orphaned.NextLeaf`)
-- **Internal merge**: Demotes separator key into merged node (`SerializeInternalRecord(separatorKey, leftNode.RightmostChild)`)
+- Skips merge if combined size > PAGE_SIZE (accepts fragmentation, no borrowing yet)
+- **Leaf merge**: Updates NextLeaf chain (`merged.NextLeaf = orphaned.NextLeaf`), adds orphaned page to free list
+- **Internal merge**: Demotes separator key into merged node (`SerializeInternalRecord(separatorKey, leftNode.RightmostChild)`), adds orphaned page to free list
 - **Parent updates**: After `DeleteRecord(separatorIndex)`, slots shift - must update pointer at new `separatorIndex` position
 
-**Phase 2 - Future Enhancements:**
+**Free Page List Implementation:**
+- `allocatePage()`: Pops from FreePageIDs if available, otherwise increments NextPageID
+- Merge operations append orphaned PageID to FreePageIDs
+- Serialized in TableHeader, persists across restarts
+- Protected by BTreeStore's RWMutex (no separate mutex needed)
+- **Verified**: 501 inserts after merges consumed 0 new pages (all reused from free list)
+
+**Future Enhancements:**
 - Node borrowing/redistribution (when merge impossible due to size)
-- Free space tracking for space reuse (orphaned pages currently not reclaimed)
-- Buffer pool for page caching (reduce disk I/O)
+- VACUUM command (rebuild tree compactly, truncate file to reclaim disk space)
+- Buffer pool for page caching (reduce fsync overhead, batch writes)
 - Support non-int primary keys via hashing (currently first field must be int32)
 - Transaction support with ACID guarantees (WAL, ARIES recovery)
-- Background compaction (VACUUM-like operation to reclaim orphaned pages)
+- Page-level checksums and compression
 
 ## Learning-Focused Interaction Guidelines
 
@@ -328,4 +356,11 @@ The user has experienced unproductive loops where:
 - Reading technical documentation (database papers, RFCs)
 
 The user learns best through guided exploration, not guided implementation.
-- note that for now the primary key (first field of schema) must be an int, but maybe we can hash it for a key value in the future that's a uint64
+
+## Important Notes
+
+- **Primary key constraint**: First field of schema must be int32 type (cast to uint64 for B+ tree keys). Future: support arbitrary types via hashing.
+- **Free list race condition protection**: FreePageIDs has no explicit mutex, but it's safe because BTreeStore's RWMutex serializes all BTree access. Every operation that touches FreePageIDs (allocatePage during Insert, append during merge in Delete) holds the write lock.
+- **Performance trade-off**: Every WritePage() calls Sync() for durability. This makes INSERT/DELETE slow (~3.5ms per operation due to fsync). Will be optimized with buffer pool + batch commits.
+- **Free list vs VACUUM**: Free list prevents file growth by reusing pages, but doesn't reclaim disk space. VACUUM needed to rebuild tree compactly and truncate file.
+- **Stress testing importance**: Catastrophic durability bug (100% data loss) only discovered through concurrent stress tests with restart verification.

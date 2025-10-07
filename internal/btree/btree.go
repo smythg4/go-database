@@ -18,6 +18,19 @@ func NewBTree(dm *pager.DiskManager, header *pager.TableHeader) *BTree {
 	}
 }
 
+func (bt *BTree) allocatePage() pager.PageID {
+	if len(bt.Header.FreePageIDs) > 0 {
+		// pop from free page list
+		pageID := bt.Header.FreePageIDs[len(bt.Header.FreePageIDs)-1]
+		bt.Header.FreePageIDs = bt.Header.FreePageIDs[:len(bt.Header.FreePageIDs)-1]
+		return pageID
+	}
+
+	pageID := bt.Header.NextPageID
+	bt.Header.NextPageID++
+	return pageID
+}
+
 func (bt *BTree) GetDepth() int {
 	breadcrumbs := &BTStack{}
 	_, _ = bt.findLeaf(0, breadcrumbs)
@@ -61,8 +74,7 @@ func (bt *BTree) findLeaf(key uint64, breadcrumbs *BTStack) (pager.PageID, error
 
 func (bt *BTree) handleRootSplit(promotedKey uint64, leftChildID, rightChildID pager.PageID) error {
 	// allocate a page for the new root node
-	newRootID := bt.Header.NextPageID
-	bt.Header.NextPageID++
+	newRootID := bt.allocatePage()
 	nsp := pager.NewSlottedPage(newRootID, pager.INTERNAL)
 	newRoot := &BNode{SlottedPage: nsp}
 
@@ -118,7 +130,8 @@ func (bt *BTree) propogateSplit(promotedKey uint64, rightPageID, leftPageID page
 		}
 
 		// page must have been full, now we split
-		rightNode, newPromotedKey, err := parent.splitNode(bt.Header.NextPageID)
+		nextPage := bt.allocatePage()
+		rightNode, newPromotedKey, err := parent.splitNode(nextPage)
 		if err != nil {
 			return err
 		}
@@ -130,7 +143,6 @@ func (bt *BTree) propogateSplit(promotedKey uint64, rightPageID, leftPageID page
 		if err := bt.writeNode(rightNode); err != nil {
 			return err
 		}
-		bt.Header.NextPageID++
 
 		// update for the next iteration
 		// the parent that just split becomes the left child for the next level
@@ -151,7 +163,6 @@ func (bt *BTree) Insert(key uint64, data []byte) error {
 		bt.Header.NumPages = uint32(bt.Header.NextPageID - 1)
 		bt.dm.SetHeader(*bt.Header)
 		bt.dm.WriteHeader()
-		bt.dm.Sync() // flush all buffered writes to disk
 	}()
 
 	// traverse to leaf, collecting breadcrumbs
@@ -180,11 +191,11 @@ func (bt *BTree) Insert(key uint64, data []byte) error {
 	}
 
 	// page was full, time to split
-	rightNode, promotedKey, err := leaf.splitNode(bt.Header.NextPageID)
+	nextPage := bt.allocatePage()
+	rightNode, promotedKey, err := leaf.splitNode(nextPage)
 	if err != nil {
 		return err
 	}
-	bt.Header.NextPageID++
 
 	// write both halves
 	if err := bt.writeNode(leaf); err != nil {
@@ -367,6 +378,8 @@ func (bt *BTree) mergeInternalNodes(sibling, underflowNode, parent *BNode, separ
 		return err
 	}
 
+	orphanedPageID := rightNode.PageID
+	bt.Header.FreePageIDs = append(bt.Header.FreePageIDs, orphanedPageID)
 	// remove separator from parent
 	if err := parent.DeleteRecord(separatorIndex); err != nil {
 		return err
@@ -409,6 +422,14 @@ func (bt *BTree) mergeLeafNodes(sibling, underflowNode, parent *BNode, separator
 	if err := bt.writeNode(mergedNode); err != nil {
 		return err
 	}
+
+	var orphanedPageID pager.PageID
+	if mergeIntoSibling {
+		orphanedPageID = underflowNode.PageID
+	} else {
+		orphanedPageID = sibling.PageID
+	}
+	bt.Header.FreePageIDs = append(bt.Header.FreePageIDs, orphanedPageID)
 	// remove separator from parent
 	if err := parent.DeleteRecord(separatorIndex); err != nil {
 		return err
@@ -545,7 +566,6 @@ func (bt *BTree) Delete(key uint64) error {
 		bt.Header.NumPages = uint32(bt.Header.NextPageID - 1)
 		bt.dm.SetHeader(*bt.Header)
 		bt.dm.WriteHeader()
-		bt.dm.Sync() // flush all buffered writes to disk
 	}()
 	// traverse to leaf, collecting breadcrumbs
 	leafPageID, err := bt.findLeaf(key, breadcrumbs)

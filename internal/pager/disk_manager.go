@@ -67,7 +67,7 @@ func (dm *DiskManager) WritePage(page Page) error {
 	if err != nil {
 		return err
 	}
-	return dm.file.Sync()
+	return dm.Sync()
 }
 
 func (dm *DiskManager) ReadSlottedPage(pageID PageID) (*SlottedPage, error) {

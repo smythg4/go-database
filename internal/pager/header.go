@@ -8,12 +8,13 @@ import (
 )
 
 type TableHeader struct {
-	Magic      [4]byte // "GDBT"
-	Version    uint16
-	RootPageID PageID
-	NextPageID PageID
-	NumPages   uint32
-	Schema     schema.Schema
+	Magic       [4]byte // "GDBT"
+	Version     uint16
+	RootPageID  PageID
+	NextPageID  PageID
+	NumPages    uint32
+	Schema      schema.Schema
+	FreePageIDs []PageID
 }
 
 func DefaultTableHeader(sch schema.Schema) TableHeader {
@@ -69,6 +70,19 @@ func (th *TableHeader) Serialize() ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
+
+	// write free page list
+	freePageLen := uint32(len(th.FreePageIDs))
+	err = binary.Write(buf, binary.LittleEndian, freePageLen)
+	if err != nil {
+		return nil, err
+	}
+	for _, pageID := range th.FreePageIDs {
+		err = binary.Write(buf, binary.LittleEndian, pageID)
+		if err != nil {
+			return nil, err
+		}
+	}
 	return buf.Bytes(), nil
 }
 
@@ -115,5 +129,19 @@ func DeserializeTableHeader(data []byte) (*TableHeader, error) {
 		return nil, err
 	}
 
+	// read free page list
+	var freePageLen uint32
+	var pageID PageID
+	err = binary.Read(r, binary.LittleEndian, &freePageLen)
+	if err != nil {
+		return nil, err
+	}
+	for i := 0; i < int(freePageLen); i++ {
+		err = binary.Read(r, binary.LittleEndian, &pageID)
+		if err != nil {
+			return nil, err
+		}
+		th.FreePageIDs = append(th.FreePageIDs, pageID)
+	}
 	return th, nil
 }
