@@ -65,6 +65,9 @@ var CommandRegistry map[string]CliCommand
 
 func init() {
 	CommandRegistry = map[string]CliCommand{
+		// add: DELETE, UPDATE, DROP
+		// future: SELECT command parsing for ranges, INSERT command PRIMARY KEY and NOT NULL
+		//			CREATE database (right now it's just TABLE)
 		".help": {
 			Name:        ".help",
 			Description: "Displays a help message.",
@@ -216,6 +219,7 @@ func commandExit(config *DatabaseConfig, params []string, w io.Writer) error {
 }
 
 func commandInsert(config *DatabaseConfig, params []string, w io.Writer) error {
+
 	fieldCount := len(config.TableS.Schema().Fields)
 
 	if len(params) != fieldCount {

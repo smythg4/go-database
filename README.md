@@ -4,12 +4,14 @@ A handrolled database implementation in Go, built from scratch as a learning pro
 
 ## Features
 
-- **Custom Binary Storage Format** - Schema headers with variable-length records
+- **B+ Tree Storage Engine** - O(log n) insertions and lookups with automatic page splitting
+- **Page-Based Disk Format** - 4KB slotted pages with binary serialization
 - **Multi-Client TCP Server** - Concurrent connections on port 42069
 - **Dynamic Schema System** - User-defined tables with custom field types
-- **SQL-like Interface** - CREATE TABLE, INSERT, SELECT with point lookups
+- **SQL-like Interface** - CREATE TABLE, INSERT, SELECT with primary key constraints
 - **Type Support** - int32, string, bool, float64 (IEEE 754 encoding)
 - **Interactive REPL** - Local command-line interface + network clients
+- **Range Scans** - Efficient range queries via leaf node sibling pointers
 
 ## Quick Start
 
@@ -23,11 +25,14 @@ go build -o godb cmd/main.go
 # In another terminal, connect via TCP
 nc localhost 42069
 
-# Run tests
+# Run all tests
 go test ./...
 
 # Run B-tree tests specifically
-go test -v ./internal/btree
+go test -v ./internal/btree/
+
+# Run page tests
+go test -v ./internal/pager/
 ```
 
 ## Example Usage
@@ -53,10 +58,15 @@ Go-DB [products]> select 2
 --------------------------------------------------------------------------------
 | 2    | mouse    | 29.95      | 200        |
 
+Go-DB [products]> insert 2 keyboard 79.99 100
+Error: key 2 already exists
+
+Go-DB [products]> stats
+Root: page 1, Type: 0, NextPageID: 2, NumPages: 1
+
 Go-DB [products]> show
 products
 users
-floaters
 
 Go-DB [products]> use users
 Switching to table: users
@@ -65,18 +75,20 @@ Switching to table: users
 ## Architecture
 
 ### Storage Layer
-- **Append-only log** with last-write-wins semantics
-- **Binary serialization** using LittleEndian encoding
-- **Schema metadata** stored in file headers
-- **Deduplication** on read (ScanAll/Find return latest record per ID)
+- **B+ Tree storage engine** - O(log n) insertions, lookups, and range scans
+- **Slotted page format** - 4KB fixed pages with 13-byte headers, slot arrays, and variable-length records
+- **Page-based disk I/O** - Binary serialization using LittleEndian encoding
+- **Schema metadata** - Stored in page 0 header with table name and field definitions
+- **Primary key constraints** - Unique constraint on first field (must be int32)
+- **Automatic splitting** - Leaf and internal nodes split when full, tree height grows dynamically
 
 ### Concurrency
-- **Table cache** ensures single TableStore instance per file
+- **Table cache** ensures single BTreeStore instance per file
 - **RWMutex protection** (writes locked, reads shared)
 - **Per-session state** for network clients
 
 ### Command Processing
-- **io.Writer abstraction** - same commands work for REPL and TCP
+- **io.Writer abstraction** - Same commands work for REPL and TCP
 - **Dynamic schema parsing** - INSERT/SELECT adapt to table structure
 - **Command registry** pattern for extensibility
 
@@ -84,12 +96,13 @@ Switching to table: users
 
 | Command | Description | Example |
 |---------|-------------|---------|
-| `create <table> <field:type> ...` | Create new table | `create users id:int name:string age:int` |
+| `create <table> <field:type> ...` | Create new table (first field = primary key) | `create users id:int name:string age:int` |
 | `use <table>` | Switch active table | `use products` |
 | `show` | List all tables | `show` |
-| `insert <values...>` | Insert record | `insert 1 alice 30` |
+| `insert <values...>` | Insert record (errors on duplicate key) | `insert 1 alice 30` |
 | `select` | Scan all records | `select` |
-| `select <id>` | Point lookup by ID | `select 5` |
+| `select <id>` | Point lookup by ID (O(log n)) | `select 5` |
+| `stats` | Show tree structure (root page, type, NextPageID) | `stats` |
 | `.help` | Show help | `.help` |
 | `.exit` | Exit the database | `.exit` |
 
@@ -105,42 +118,58 @@ Multiple clients can connect simultaneously. Each client maintains independent s
 
 ## File Format
 
-Tables are stored as `.db` files with the following structure:
+Tables are stored as `.db` files with page-based B+ tree structure:
 
 ```
-[Schema Header]
-  - Table name (length-prefixed string)
-  - Field count (uint32)
-  - For each field:
-    - Field name (length-prefixed string)
-    - Field type (1 byte: 0=int, 1=string, 2=bool, 3=float)
+[Page 0: Table Header - 4KB]
+  - Magic: "GDBT" (4 bytes)
+  - Version: 1 (uint16)
+  - RootPageID: Page ID of root node (uint32)
+  - NextPageID: Next available page for allocation (uint32)
+  - NumPages: Total pages in file (uint32)
+  - Schema:
+    - Table name (length-prefixed string)
+    - Field count (uint32)
+    - For each field:
+      - Field name (length-prefixed string)
+      - Field type (1 byte: 0=int, 1=string, 2=bool, 3=float)
 
-[Records]
-  - Variable-length records in schema field order
-  - Types encoded as:
+[Page 1+: Slotted Pages - 4KB each]
+  Header (13 bytes):
+    - PageType: LEAF (0) or INTERNAL (1)
+    - NumSlots: Number of records/keys (uint16)
+    - FreeSpacePtr: Offset to free space (uint16)
+    - RightmostChild: Child page for keys > all slots (uint32, internal only)
+    - NextLeaf: Sibling page pointer (uint32, leaf only)
+
+  Slot Array (grows downward from byte 13):
+    - Each slot: [offset: uint16][length: uint16]
+
+  Records (grow upward from end):
+    - Leaf: [key: 8 bytes uint64][serialized record data]
+    - Internal: [key: 8 bytes uint64][child PageID: 4 bytes uint32]
+
+  Types encoded as:
     - int32: 4 bytes LittleEndian
     - string: 4-byte length + UTF-8 bytes
     - bool: 1 byte (0/1)
     - float64: 8 bytes (IEEE 754 via math.Float64bits)
 ```
 
-Example hexdump of `products.db`:
+Example hexdump showing header with B+ tree metadata:
 ```
-00000000: 0800 0000 7072 6f64 7563 7473 0400 0000  ....products....
-00000010: 0200 0000 6964 0004 0000 006e 616d 6501  ....id.....name.
-00000020: 0500 0000 7072 6963 6503 0500 0000 7374  ....price.....st
-00000030: 6f63 6b00 0100 0000 0600 0000 6c61 7074  ock.........lapt
-00000040: 6f70 d7a3 703d 0a8f 40c0 3200 0000       op..p=..@.2...
+00000000: 4744 4254 0100 0100 0000 0200 0000 0100  GDBT............
+          ^^^^ ^^^^ ^^^^ ^^^^  ^^^^ ^^^^  ^^^^ ^^^^
+          Magic Ver  Root=1     Next=2     NumPages=1
 ```
 
-## Known Limitations (Current Append-Only Storage)
+## Current Limitations
 
-- **File descriptor sharing**: Concurrent writes under heavy load may cause corruption (shared `os.File` handle not thread-safe)
-- **Map iteration randomness**: SELECT results may appear in different order each time (Go map iteration is deliberately randomized)
-- **No file closing**: Files remain open for program lifetime (OS cleans up on exit)
-- **O(n) scans**: Full table scans required for all queries (no indexing yet)
-
-**Note**: These are accepted limitations of the current append-only log design. The in-progress B-tree page-based storage will address all of them.
+- **Insert-only**: No UPDATE or DELETE commands yet (use separate tables for versioning)
+- **Primary key must be int32**: First field in schema must be int32 type
+- **No transactions**: Operations commit immediately, no rollback support
+- **No buffer pool**: Every page read/write hits disk (future optimization)
+- **No node merging**: Tree grows but never shrinks (deletions not implemented)
 
 ## Learning Resources
 
@@ -149,35 +178,40 @@ This project follows concepts from:
 - **"Introduction to Algorithms" (CLRS)** - B-tree algorithms
 - **"Building a Database from Scratch in Go" by James Smith** - Initial inspiration
 
-## B+ Tree Storage Engine
+## B+ Tree Implementation Details
 
-A fully functional B+ tree implementation is complete and tested:
+The storage engine uses a fully functional B+ tree with the following characteristics:
 
-**✅ Completed:**
-- **Slotted page layout** - 4KB fixed pages with 13-byte headers, slot arrays, and variable-length records
-- **Page-level disk I/O** - Binary serialization with LittleEndian encoding
-- **Leaf node splits** - Promoted key handling with sibling pointer maintenance
-- **Internal node splits** - Child pointer management and cascading split propagation
-- **Root split handling** - Dynamic tree height growth when root overflows
-- **Insert operation** - O(log n) insertion with automatic splitting and rebalancing
-- **Search operation** - O(log n) point queries with multi-level tree traversal
-- **RangeScan operation** - O(log n + k) range queries using sibling pointer chain
-- **Table header** - PageID allocation tracking with durable persistence
-- **Comprehensive test suite** - TestInsertNoSplit, TestInsertWithRootSplit, TestSearch, TestSearchAfterSplit, TestRangeScan
+**✅ Core Operations:**
+- **Insert** - O(log n) insertion with duplicate key detection, automatic splitting, and cascading propagation
+- **Search** - O(log n) point queries with multi-level tree traversal (max depth 100)
+- **RangeScan** - O(log n + k) range queries using sibling pointer chain across leaf nodes
+- **Stats** - Debug helper showing root page ID, node type (LEAF/INTERNAL), and NextPageID allocation
 
-**Key Features:**
-- Binary search for sorted insertion and lookup
-- Breadcrumb stack pattern for bottom-up split propagation
-- Sibling pointers linking leaf nodes for efficient range scans
-- Max depth safety checks to prevent infinite loops
-- Critical child pointer updates after split operations
+**Key Implementation Details:**
+- **Slotted pages** - 4KB fixed pages with 13-byte headers, slot arrays growing downward, records growing upward
+- **Binary search** - Sorted insertion and lookup within pages
+- **Breadcrumb stack** - Tracks descent path for bottom-up split propagation (pattern from Petrov's "Database Internals")
+- **Sibling pointers** - Leaf nodes linked for efficient range scans (B+ tree characteristic)
+- **Child pointer management** - After inserting promoted key at index i, updates record[i+1] or RightmostChild
+- **Header durability** - Defer pattern syncs BTree header changes (RootPageID, NextPageID) back to DiskManager before write
+- **Primary key uniqueness** - Search before insert, error on duplicate key (PostgreSQL-style behavior)
 
-**📋 Next Steps:**
-- Integrate B+ tree with existing CLI (replace append-only TableStore)
-- Implement Delete operation with node merging/rebalancing
-- Add buffer pool for page caching in memory
-- Update command handlers to use B-tree backend
-- O(log n) lookups replacing current O(n) scans
+**Test Coverage:**
+- Insert without split (single leaf)
+- Insert with root split (tree height growth from 1 → 2)
+- Search in single-level and multi-level trees
+- Range scan across multiple leaves via sibling pointers
+- Page serialization round-trips
+- Split mechanics (leaf/internal with child pointer validation)
+- Stress testing: 150 inserts verified multi-level tree growth
+
+**Future Enhancements:**
+- DELETE operation with node merging/rebalancing
+- Buffer pool for page caching (reduce disk I/O)
+- Support non-int primary keys via hashing (currently first field must be int32)
+- Transaction support with ACID guarantees
+- UPDATE command for modifying existing records
 
 ## Project Goals
 

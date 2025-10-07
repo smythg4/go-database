@@ -156,6 +156,9 @@ func (bt *BTree) Insert(key uint64, data []byte) error {
 	if err != nil {
 		return err
 	}
+	if _, present := leaf.Search(key); present {
+		return fmt.Errorf("key %d already exists", key)
+	}
 	_, err = leaf.InsertRecordSorted(data)
 
 	if err == nil {
