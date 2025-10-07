@@ -116,17 +116,15 @@ func (bts *BTreeStore) Find(key int) (schema.Record, error) {
 	return result, nil
 }
 
-func (bts *BTreeStore) ScanAll() ([]schema.Record, error) {
+func (bts *BTreeStore) RangeScan(startKey, endKey uint64) ([]schema.Record, error) {
 	bts.mu.RLock()
 	defer bts.mu.RUnlock()
 
-	// Get all records
-	results, err := bts.bt.RangeScan(0, math.MaxUint64)
+	results, err := bts.bt.RangeScan(startKey, endKey)
 	if err != nil {
 		return nil, err
 	}
 
-	// Deserialize each
 	records := make([]schema.Record, 0, len(results))
 	for _, data := range results {
 		_, rec, err := bts.bt.Header.Schema.DeserializeRecord(data)
@@ -137,6 +135,10 @@ func (bts *BTreeStore) ScanAll() ([]schema.Record, error) {
 	}
 
 	return records, nil
+}
+
+func (bts *BTreeStore) ScanAll() ([]schema.Record, error) {
+	return bts.RangeScan(0, math.MaxUint64)
 }
 func (bts *BTreeStore) Close() error {
 	// BTree doesn't need explicit closing, but we could sync here

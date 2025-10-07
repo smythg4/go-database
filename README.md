@@ -8,14 +8,16 @@ A from-scratch database implementation in Go, built to answer the question: 'How
 - **Page-Based Disk Format** - 4KB slotted pages with binary serialization
 - **Multi-Client TCP Server** - Concurrent connections on port 42069
 - **Dynamic Schema System** - User-defined tables with custom field types
-- **SQL-like Interface** - CREATE, INSERT, SELECT, UPDATE, DELETE with primary key constraints
+- **SQL-like Interface** - CREATE, INSERT, SELECT, UPDATE, DELETE, DESCRIBE, COUNT with primary key constraints
 - **Node Merging** - Automatic page merging when nodes become underfull after deletion
+- **Range Queries** - Efficient range scans with O(log n + k) complexity via leaf sibling pointers
 - **Type Support** - int32, string, bool, float64, date (ISO 8601)
 - **Primary Key Uniqueness** - Duplicate key detection with PostgreSQL-style errors
 - **Interactive REPL** - Local command-line interface + network clients
-- **Range Scans** - Efficient range queries via leaf node sibling pointers
+- **Schema Introspection** - DESCRIBE command shows table structure and field types
 
 ## Points of Pride
+- **3,538x faster lookups** - Benchmarked against legacy append-only storage: 6.9μs vs 24ms for 10,000 record lookups. O(log n) vs O(n) in action.
 - **500 concurrent inserts, zero corruption** - Stress tested with 5 concurrent TCP clients, all 5 data types, multi-level tree growth. RWMutex protection actually works.
 - **Breadcrumb stack for split propogation** - Implemented Petrov's breadcrumb pattern for bottom-up split cascading. Took 3 tries to get child pointer updates right.
 - **Full CRUD operations** - CREATE, INSERT, SELECT, UPDATE, DELETE all working with proper error handling and persistence.
@@ -41,6 +43,9 @@ go test -v ./internal/btree/
 
 # Run page tests
 go test -v ./internal/pager/
+
+# Benchmark B+Tree vs legacy storage
+go test -bench=. ./internal/store/
 ```
 
 ## Example Usage
@@ -89,7 +94,7 @@ Go-DB [employees]> select
 | 1    | alice    | 1985-06-15 |
 
 Go-DB [employees]> stats
-Root: page 1, Type: 0, NextPageID: 2, NumPages: 1
+Root: page 1, Type: 0, NextPageID: 2, NumPages: 1, Tree Depth: 1
 
 Go-DB [employees]> show
 products
@@ -97,6 +102,35 @@ employees
 
 Go-DB [employees]> use products
 Switching to table: products
+
+Go-DB [products]> describe
+Table: products
+   id (int) - PRIMARY KEY
+   name (string)
+   price (float)
+   stock (int)
+
+Go-DB [products]> insert 3 keyboard 79.99 150
+Inserting map[id:3 name:keyboard price:79.99 stock:150] into table products
+
+Go-DB [products]> insert 4 monitor 299.99 75
+Inserting map[id:4 name:monitor price:299.99 stock:75] into table products
+
+Go-DB [products]> select 2 4
+| id   | name     | price      | stock      |
+--------------------------------------------------------------------------------
+| 2    | mouse    | 29.95      | 200        |
+| 3    | keyboard | 79.99      | 150        |
+| 4    | monitor  | 299.99     | 75         |
+
+Go-DB [products]> count 2 4
+Count: 3
+
+Go-DB [products]> count
+Count: 3
+
+Go-DB [products]> stats
+Root: page 1, Type: 0, NextPageID: 2, NumPages: 1, Tree Depth: 1
 ```
 
 ## Architecture
@@ -126,12 +160,17 @@ Switching to table: products
 | `create <table> <field:type> ...` | Create new table (first field = primary key) | `create users id:int name:string birthdate:date` |
 | `use <table>` | Switch active table | `use products` |
 | `show` | List all tables | `show` |
+| `describe` | Show schema for active table | `describe` |
 | `insert <values...>` | Insert record (errors on duplicate key) | `insert 1 alice 1990-05-15` |
 | `select` | Scan all records | `select` |
 | `select <id>` | Point lookup by ID (O(log n)) | `select 5` |
+| `select <start> <end>` | Range query (O(log n + k)) | `select 10 100` |
 | `update <values...>` | Update record (DELETE + INSERT) | `update 5 bob 1992-03-20` |
 | `delete <id>` | Delete record by ID (O(log n)) | `delete 5` |
-| `stats` | Show tree structure (root page, type, NextPageID) | `stats` |
+| `count` | Count all records | `count` |
+| `count <id>` | Count single record (0 or 1) | `count 5` |
+| `count <start> <end>` | Count records in range | `count 10 100` |
+| `stats` | Show tree structure (root, depth, pages) | `stats` |
 | `.help` | Show help | `.help` |
 | `.exit` | Exit the database | `.exit` |
 
@@ -204,10 +243,10 @@ Example hexdump showing header with B+ tree metadata:
 
 - **UPDATE uses DELETE + INSERT**: Not true in-place modification (functional but not optimal)
 - **No borrowing during rebalance**: Merge-only strategy may cause fragmentation in some cases
+- **No free page list**: Orphaned pages after merges are not reclaimed (NextPageID never decreases)
 - **Primary key must be int32**: First field in schema must be int32 type
 - **No transactions**: Operations commit immediately, no rollback support
 - **No buffer pool**: Every page read/write hits disk (future optimization)
-- **No space reuse**: Deleted records' space not tracked for reuse on INSERT
 
 ## Learning Resources
 
@@ -250,13 +289,13 @@ The storage engine uses a fully functional B+ tree with the following characteri
 - Stress testing: 150 inserts verified multi-level tree growth
 
 **Future Enhancements:**
+- Free page list (track orphaned pages for reuse, prevent file growth)
+- VACUUM command (rebuild tree compactly, reclaim disk space)
 - Node borrowing (currently merge-only, no borrowing from siblings)
-- Free space tracking for space reuse after deletes
 - Buffer pool for page caching (reduce disk I/O)
 - Support non-int primary keys via hashing (currently first field must be int32)
 - Transaction support with ACID guarantees (WAL, ARIES recovery)
 - True in-place UPDATE (currently uses DELETE + INSERT pattern)
-- Background compaction (VACUUM-like operation)
 
 ## Project Goals
 

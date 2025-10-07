@@ -6,6 +6,7 @@ import (
 	"godb/internal/schema"
 	"godb/internal/store"
 	"io"
+	"math"
 	"net"
 	"os"
 	"strconv"
@@ -65,60 +66,106 @@ var CommandRegistry map[string]CliCommand
 
 func init() {
 	CommandRegistry = map[string]CliCommand{
-		// add: UPDATE, DROP
-		// future: SELECT command parsing for ranges, INSERT command PRIMARY KEY and NOT NULL
-		//			CREATE database (right now it's just TABLE)
 		".help": {
 			Name:        ".help",
-			Description: "Display available commands and usage information",
+			Description: "Show all available commands",
 			Callback:    commandHelp,
 		},
 		".exit": {
 			Name:        ".exit",
-			Description: "Exit the database and close all connections",
+			Description: "Exit the database",
 			Callback:    commandExit,
 		},
 		"create": {
 			Name:        "create",
-			Description: "Create a new table - usage: create <tablename> <field:type> ...",
+			Description: "Create new table - usage: create <table> <field:type> ... (first field is primary key)",
 			Callback:    commandCreate,
 		},
 		"use": {
 			Name:        "use",
-			Description: "Switch to a different table - usage: use <tablename>",
+			Description: "Switch active table - usage: use <table>",
 			Callback:    commandUse,
 		},
 		"show": {
 			Name:        "show",
-			Description: "List all available tables in the database",
+			Description: "List all tables",
 			Callback:    commandShow,
+		},
+		"describe": {
+			Name:        "describe",
+			Description: "Show schema for active table",
+			Callback:    commandDescribe,
 		},
 		"insert": {
 			Name:        "insert",
-			Description: "Insert a new record into the active table - usage: insert <value1> <value2> ...",
+			Description: "Insert record - usage: insert <val1> <val2> ... (must match schema)",
 			Callback:    commandInsert,
 		},
 		"select": {
 			Name:        "select",
-			Description: "Query records from the active table - usage: select [id] (omit id for full scan)",
+			Description: "Query records - usage: select | select <id> | select <start> <end>",
 			Callback:    commandSelect,
-		},
-		"delete": {
-			Name:        "delete",
-			Description: "Delete a record from the active table by primary key - usage: delete <id>",
-			Callback:    commandDelete,
 		},
 		"update": {
 			Name:        "update",
-			Description: "Update a record from the active table - usage: update <value1> <value2> ...",
+			Description: "Update record - usage: update <val1> <val2> ... (primary key must exist)",
 			Callback:    commandUpdate,
+		},
+		"delete": {
+			Name:        "delete",
+			Description: "Delete record - usage: delete <id>",
+			Callback:    commandDelete,
+		},
+		"count": {
+			Name:        "count",
+			Description: "Count records - usage: count | count <id> | count <start> <end>",
+			Callback:    commandCount,
 		},
 		"stats": {
 			Name:        "stats",
-			Description: "Display B+ tree statistics for the active table (root page, type, page count)",
+			Description: "Show B+ tree statistics (root page, type, page count)",
 			Callback:    commandStats,
 		},
 	}
+}
+
+func fieldString(typ schema.FieldType) (string, error) {
+	switch typ {
+	case schema.IntType:
+		return "int", nil
+	case schema.FloatType:
+		return "float", nil
+	case schema.StringType:
+		return "string", nil
+	case schema.BoolType:
+		return "bool", nil
+	case schema.DateType:
+		return "date", nil
+	default:
+		return "", fmt.Errorf("type not found: %v", typ)
+	}
+
+}
+
+func commandDescribe(config *DatabaseConfig, params []string, w io.Writer) error {
+	var pKeyHuh string
+	sch := config.TableS.Schema()
+	tName := sch.TableName
+	fmt.Fprintf(w, "Table: %s\n", tName)
+	for i, rec := range sch.Fields {
+		fName := rec.Name
+		fType, err := fieldString(rec.Type)
+		if err != nil {
+			return err
+		}
+		if i == 0 {
+			pKeyHuh = " - PRIMARY KEY"
+		} else {
+			pKeyHuh = ""
+		}
+		fmt.Fprintf(w, "   %s (%s)%s\n", fName, fType, pKeyHuh)
+	}
+	return nil
 }
 
 func commandStats(config *DatabaseConfig, params []string, w io.Writer) error {
@@ -326,9 +373,52 @@ func selectAll(config *DatabaseConfig, w io.Writer) error {
 	return nil
 }
 
+func rangeScan(config *DatabaseConfig, w io.Writer, params []string) error {
+	startKey, err := strconv.Atoi(params[0])
+	if err != nil {
+		return err
+	}
+	endKey, err := strconv.Atoi(params[1])
+	if err != nil {
+		return err
+	}
+
+	records, err := config.TableS.RangeScan(uint64(startKey), uint64(endKey))
+	if err != nil {
+		return err
+	}
+
+	fieldNames := config.TableS.Schema().GetFieldNames()
+	widths := make([]int, len(fieldNames))
+	for i, field := range fieldNames {
+		widths[i] = len(field) * 4
+	}
+	fmt.Fprint(w, "| ")
+	for i, field := range fieldNames {
+		fmt.Fprintf(w, "%-*s | ", widths[i], field)
+	}
+	fmt.Fprintln(w)
+	fmt.Fprintln(w, strings.Repeat("-", len(fieldNames)*20))
+
+	for _, record := range records {
+		fmt.Fprint(w, "| ")
+		for i, field := range config.TableS.Schema().Fields {
+			val := fmt.Sprintf("%v", record[field.Name])
+			fmt.Fprintf(w, "%-*s | ", widths[i], val)
+		}
+		fmt.Fprintln(w)
+	}
+
+	return nil
+}
+
 func commandSelect(config *DatabaseConfig, params []string, w io.Writer) error {
 	if len(params) == 0 {
 		return selectAll(config, w)
+	}
+
+	if len(params) == 2 {
+		return rangeScan(config, w, params)
 	}
 
 	fieldNames := config.TableS.Schema().GetFieldNames()
@@ -358,4 +448,43 @@ func commandSelect(config *DatabaseConfig, params []string, w io.Writer) error {
 	fmt.Fprintln(w)
 
 	return err
+}
+
+func commandCount(config *DatabaseConfig, params []string, w io.Writer) error {
+	var startKey uint64
+	var endKey uint64
+	var err error
+	if len(params) == 0 {
+		startKey = 0
+		endKey = math.MaxUint64
+	}
+
+	if len(params) == 2 {
+		sk, err := strconv.Atoi(params[0])
+		if err != nil {
+			return err
+		}
+		ek, err := strconv.Atoi(params[1])
+		if err != nil {
+			return err
+		}
+		startKey = uint64(sk)
+		endKey = uint64(ek)
+	}
+
+	if len(params) == 1 {
+		sk, err := strconv.Atoi(params[0])
+		if err != nil {
+			return err
+		}
+		startKey = uint64(sk)
+		endKey = uint64(sk)
+	}
+	records, err := config.TableS.RangeScan(startKey, endKey)
+	if err != nil {
+		return err
+	}
+	count := len(records)
+	fmt.Fprintf(w, "Count: %d\n", count)
+	return nil
 }

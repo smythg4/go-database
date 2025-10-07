@@ -18,6 +18,12 @@ func NewBTree(dm *pager.DiskManager, header *pager.TableHeader) *BTree {
 	}
 }
 
+func (bt *BTree) GetDepth() int {
+	breadcrumbs := &BTStack{}
+	_, _ = bt.findLeaf(0, breadcrumbs)
+	return breadcrumbs.Length() + 1
+}
+
 func (bt *BTree) loadNode(pageID pager.PageID) (*BNode, error) {
 	sp, err := bt.dm.ReadSlottedPage(pageID)
 	if err != nil {
@@ -584,6 +590,10 @@ type BTStack struct {
 	Crumbs []BreadCrumb
 }
 
+func (s *BTStack) Length() int {
+	return len(s.Crumbs)
+}
+
 func (s *BTStack) isEmpty() bool {
 	return len(s.Crumbs) == 0
 }
@@ -629,6 +639,7 @@ func (bn *BNode) splitNode(newPageID pager.PageID) (*BNode, uint64, error) {
 
 func (bt *BTree) Stats() string {
 	root, _ := bt.loadNode(bt.Header.RootPageID)
-	return fmt.Sprintf("Root: page %d, Type: %v, NextPageID: %d, NumPages: %d",
-		bt.Header.RootPageID, root.PageType, bt.Header.NextPageID, bt.Header.NumPages)
+	depth := bt.GetDepth()
+	return fmt.Sprintf("Root: page %d, Type: %v, NextPageID: %d, NumPages: %d, Tree Depth: %d",
+		bt.Header.RootPageID, root.PageType, bt.Header.NextPageID, bt.Header.NumPages, depth)
 }
