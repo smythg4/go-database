@@ -38,6 +38,15 @@ type Page struct {
 	Data   [PAGE_SIZE]byte
 }
 
+func (sp *SlottedPage) GetUsedSpace() uint16 {
+	return PAGE_SIZE - sp.FreeSpacePtr
+}
+
+func (sp *SlottedPage) IsUnderfull() bool {
+	// threshold used to determine if a merge is warranted
+	return sp.GetUsedSpace() < PAGE_SIZE/2
+}
+
 func (sp *SlottedPage) Serialize() Page {
 	var page Page
 	page.PageID = sp.PageID
@@ -175,11 +184,13 @@ func (sp *SlottedPage) DeleteRecord(slotIndex int) error {
 		return errors.New("slot out of range")
 	}
 
-	sp.Records = append(sp.Records[:slotIndex], sp.Records[slotIndex+1:]...)
-	sp.Slots = append(sp.Slots[:slotIndex], sp.Slots[slotIndex+1:]...)
+	sp.Slots[slotIndex].Offset = 0
+	sp.Slots[slotIndex].Length = 0
+	sp.Records[slotIndex] = nil
 	sp.NumSlots--
 
-	return nil
+	// this is inefficient, but maximizes available space
+	return sp.Compact()
 }
 
 func (sp *SlottedPage) GetKey(slotIndex int) uint64 {
@@ -253,7 +264,7 @@ func DeserializeInternalRecord(data []byte) (uint64, PageID) {
 	return key, PageID(pgid)
 }
 
-func (sp *SlottedPage) Compact() {
+func (sp *SlottedPage) Compact() error {
 	activeRecords := [][]byte{}
 
 	for i, slot := range sp.Slots {
@@ -270,8 +281,12 @@ func (sp *SlottedPage) Compact() {
 
 	// re-insert all active records
 	for _, record := range activeRecords {
-		_, _ = sp.InsertRecord(record)
+		_, err := sp.InsertRecord(record)
+		if err != nil {
+			return err
+		}
 	}
+	return nil
 }
 
 func (sp *SlottedPage) SplitLeaf(newPageID PageID) (*SlottedPage, uint64, error) {
@@ -290,8 +305,10 @@ func (sp *SlottedPage) SplitLeaf(newPageID PageID) (*SlottedPage, uint64, error)
 	// truncate and compact the original leaf node
 	sp.Slots = sp.Slots[:mid]
 	sp.Records = sp.Records[:mid]
-	sp.Compact()
-
+	err := sp.Compact()
+	if err != nil {
+		return nil, 0, err
+	}
 	promotedKey := newPage.GetKey(0)
 
 	// update sibling pointers
@@ -326,4 +343,65 @@ func (sp *SlottedPage) SplitInternal(newPageID PageID) (*SlottedPage, uint64, er
 	sp.Compact()
 
 	return newPage, promotedKey, nil
+}
+
+func (sp *SlottedPage) CanMergeWith(sibling *SlottedPage) bool {
+	// check to see if two pages can be merged into a single  page
+	leftSize := sp.GetUsedSpace()
+	rightSize := sibling.GetUsedSpace()
+	combinedSize := leftSize + rightSize
+
+	// calc size needed for slot array
+	combinedSlots := sp.NumSlots + sibling.NumSlots
+	slotArraySize := 13 + (combinedSlots * 4) // header + slots
+
+	return uint16(slotArraySize)+combinedSize <= PAGE_SIZE
+}
+
+func (sp *SlottedPage) MergeLeaf(sibling *SlottedPage) error {
+	if sp.PageType != LEAF || sibling.PageType != LEAF {
+		return errors.New("both pages must be leaf pages")
+	}
+
+	if !sp.CanMergeWith(sibling) {
+		return errors.New("pages too large to merge")
+	}
+
+	// copy all records from sibling to this page
+	for i := 0; i < int(sibling.NumSlots); i++ {
+		if sibling.Slots[i].Offset > 0 && sibling.Slots[i].Length > 0 {
+			_, err := sp.InsertRecordSorted(sibling.Records[i])
+			if err != nil {
+				return err
+			}
+		}
+	}
+
+	// update sibling pointer chain
+	sp.NextLeaf = sibling.NextLeaf
+
+	return nil
+}
+
+func (sp *SlottedPage) MergeInternals(sibling *SlottedPage) error {
+	if sp.PageType != INTERNAL || sibling.PageType != INTERNAL {
+		return errors.New("all pages must be INTERNAL")
+	}
+
+	if !sp.CanMergeWith(sibling) {
+		return errors.New("pages too large to merge")
+	}
+
+	// copy all records from sibling to this page
+	for i := 0; i < int(sibling.NumSlots); i++ {
+		if sibling.Slots[i].Offset > 0 && sibling.Slots[i].Length > 0 {
+			_, err := sp.InsertRecordSorted(sibling.Records[i])
+			if err != nil {
+				return err
+			}
+		}
+	}
+	// update the rightmost child to reflect the sibling's rightmostchild
+	sp.RightmostChild = sibling.RightmostChild
+	return nil
 }

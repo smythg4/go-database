@@ -80,3 +80,7 @@ func (dm *DiskManager) WriteSlottedPage(sp *SlottedPage) error {
 	page := sp.Serialize()
 	return dm.WritePage(page)
 }
+
+func (dm *DiskManager) Sync() error {
+	return dm.file.Sync()
+}

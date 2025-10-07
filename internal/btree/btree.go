@@ -138,34 +138,6 @@ func (bt *BTree) propogateSplit(promotedKey uint64, rightPageID, leftPageID page
 	return bt.handleRootSplit(promotedKey, leftPageID, rightPageID)
 }
 
-func (bt *BTree) Delete(key uint64) error {
-	breadcrumbs := &BTStack{}
-	defer func() {
-		// we were writing stale headers. This will ensure that it's up to date before writing to the disk
-		bt.Header.NumPages = uint32(bt.Header.NextPageID - 1)
-		bt.dm.SetHeader(*bt.Header)
-		bt.dm.WriteHeader()
-	}()
-	// traverse to leaf, collecting breadcrumbs
-	leafPageID, err := bt.findLeaf(key, breadcrumbs)
-	if err != nil {
-		return err
-	}
-	leaf, err := bt.loadNode(leafPageID)
-	if err != nil {
-		return err
-	}
-	idx, present := leaf.Search(key)
-	if !present {
-		return fmt.Errorf("key %d was not found", key)
-	}
-	err = leaf.DeleteRecord(idx)
-	if err != nil {
-		return err
-	}
-	return bt.writeNode(leaf)
-}
-
 func (bt *BTree) Insert(key uint64, data []byte) error {
 	breadcrumbs := &BTStack{}
 	defer func() {
@@ -173,6 +145,7 @@ func (bt *BTree) Insert(key uint64, data []byte) error {
 		bt.Header.NumPages = uint32(bt.Header.NextPageID - 1)
 		bt.dm.SetHeader(*bt.Header)
 		bt.dm.WriteHeader()
+		bt.dm.Sync() // flush all buffered writes to disk
 	}()
 
 	// traverse to leaf, collecting breadcrumbs
@@ -279,7 +252,15 @@ func (bt *BTree) RangeScan(startKey, endKey uint64) ([][]byte, error) {
 	leafPageID, _ := bt.findLeaf(startKey, &BTStack{})
 
 	var results [][]byte
+	visited := make(map[pager.PageID]bool) // cycle detection
+
 	for leafPageID != 0 { // 0 = end of the line
+		// Check for cycles
+		if visited[leafPageID] {
+			return nil, fmt.Errorf("cycle detected in leaf chain at page %d", leafPageID)
+		}
+		visited[leafPageID] = true
+
 		leaf, _ := bt.loadNode(leafPageID)
 		for i := 0; i < int(leaf.NumSlots); i++ {
 			key := leaf.GetKey(i)
@@ -294,8 +275,300 @@ func (bt *BTree) RangeScan(startKey, endKey uint64) ([][]byte, error) {
 		}
 		leafPageID = leaf.NextLeaf
 	}
-	// this is incomplete! We're only scanning a single page. We need sibling pointers to neighbor leaves
 	return results, nil
+}
+
+func (bt *BTree) findLeftSibling(parent *BNode, childIndex int) (pager.PageID, int, bool) {
+	if childIndex == 0 {
+		return 0, -1, false // no left sibling
+	}
+	if parent.PageType != pager.INTERNAL {
+		return 0, -1, false // parent must be an internal page (not a leaf)
+	}
+
+	var siblingID pager.PageID
+	var separatorIndex int
+
+	if childIndex == -1 {
+		// we're rightmostchild, left sibling is last record
+		separatorIndex = int(parent.NumSlots) - 1
+		_, siblingID = pager.DeserializeInternalRecord(parent.Records[separatorIndex])
+	} else {
+		// normal case: left sibling is at childIndex-1
+		separatorIndex = childIndex - 1
+		_, siblingID = pager.DeserializeInternalRecord(parent.Records[separatorIndex])
+	}
+
+	return siblingID, separatorIndex, true
+}
+
+func (bt *BTree) findRightSibling(parent *BNode, childIndex int) (pager.PageID, int, bool) {
+	if childIndex == -1 {
+		return 0, -1, false // we're the rightmostchild
+	}
+	if parent.PageType != pager.INTERNAL {
+		return 0, -1, false // parent must be an internal page (not a leaf)
+	}
+
+	var siblingID pager.PageID
+	separatorIndex := childIndex
+
+	if childIndex == int(parent.NumSlots)-1 {
+		// right sibling is rightmostchild
+		siblingID = parent.RightmostChild
+	} else {
+		// normal case: right sibling is at childIndex+1
+		_, siblingID = pager.DeserializeInternalRecord(parent.Records[childIndex+1])
+	}
+
+	return siblingID, separatorIndex, true
+}
+
+func (bt *BTree) mergeInternalNodes(sibling, underflowNode, parent *BNode, separatorIndex int, mergeIntoSibling bool) error {
+	// true = we get merged into left, false = right merged into us
+	if sibling.IsLeaf() || underflowNode.IsLeaf() || parent.IsLeaf() {
+		return errors.New("both siblings and parent must be INTERNAL nodes, not leaves")
+	}
+
+	// determine left or right
+	var leftNode, rightNode *BNode
+	if mergeIntoSibling {
+		leftNode = sibling
+		rightNode = underflowNode
+	} else {
+		leftNode = underflowNode
+		rightNode = sibling
+	}
+
+	// get the key to demote
+	separatorKey, _ := pager.DeserializeInternalRecord(parent.Records[separatorIndex])
+
+	// demote: insert separator into the left, pointing to the left's rightmostchild
+	demotedRecord := pager.SerializeInternalRecord(separatorKey, leftNode.RightmostChild)
+	_, err := leftNode.InsertRecordSorted(demotedRecord)
+	if err != nil {
+		return err
+	}
+
+	// merge right into left
+	err = leftNode.MergeInternals(rightNode.SlottedPage)
+	if err != nil {
+		return err
+	}
+
+	// write merged node
+	if err := bt.writeNode(leftNode); err != nil {
+		return err
+	}
+
+	// remove separator from parent
+	if err := parent.DeleteRecord(separatorIndex); err != nil {
+		return err
+	}
+
+	// update parent pointer
+	/// this will need to change if we shift to a tombstone model
+	if separatorIndex < int(parent.NumSlots) {
+		oldKey, _ := pager.DeserializeInternalRecord(parent.Records[separatorIndex])
+		parent.Records[separatorIndex] = pager.SerializeInternalRecord(oldKey, leftNode.PageID)
+	} else {
+		parent.RightmostChild = leftNode.PageID
+	}
+
+	return nil
+}
+
+func (bt *BTree) mergeLeafNodes(sibling, underflowNode, parent *BNode, separatorIndex int, mergeIntoSibling bool) error {
+	// true = we get merged into left, false = right merged into us
+	if !sibling.IsLeaf() || !underflowNode.IsLeaf() || parent.IsLeaf() {
+		return errors.New("both siblings must be LEAF, parent must be INTERNAL")
+	}
+
+	var mergedNode *BNode
+	var err error
+	if mergeIntoSibling {
+		// this means we found a left sibling, merge into that
+		err = sibling.MergeLeaf(underflowNode.SlottedPage)
+		mergedNode = sibling
+	} else {
+		// this means we found a right sibling, merge us into it
+		err = underflowNode.MergeLeaf(sibling.SlottedPage)
+		mergedNode = underflowNode
+	}
+	if err != nil {
+		return err
+	}
+
+	// write mergedNode
+	if err := bt.writeNode(mergedNode); err != nil {
+		return err
+	}
+	// remove separator from parent
+	if err := parent.DeleteRecord(separatorIndex); err != nil {
+		return err
+	}
+
+	// update parent pointer - after DeleteRecord slots shift down
+	// what was Records[separatorIndex+1] is now Records[separatorIndex]
+	/// this will need to change if we shift to a tombstone model
+	if separatorIndex < int(parent.NumSlots) {
+		oldKey, _ := pager.DeserializeInternalRecord(parent.Records[separatorIndex])
+		parent.Records[separatorIndex] = pager.SerializeInternalRecord(oldKey, mergedNode.PageID)
+	} else {
+		// deleted the last record, just update rightmostchild
+		parent.RightmostChild = mergedNode.PageID
+	}
+
+	return nil
+}
+
+func (bt *BTree) handleRootUnderflow(pageID pager.PageID) error {
+	if pageID != bt.Header.RootPageID {
+		return fmt.Errorf("rootpageid mismatch; actual: %d, expected: %d", pageID, bt.Header.RootPageID)
+	}
+	root, err := bt.loadNode(pageID)
+	if err != nil {
+		return err
+	}
+	if root.IsLeaf() {
+		// root leaf is underfull but can't collapse - just accept it
+		return nil
+	}
+
+	// Internal root - only collapse if completely empty (NumSlots == 0)
+	if root.NumSlots > 0 {
+		// Still has keys - underfull is OK for root
+		return nil
+	}
+
+	// Root has 0 slots, only RightmostChild remains - collapse it
+	if root.RightmostChild == 0 {
+		return fmt.Errorf("internal root has no children")
+	}
+
+	bt.Header.RootPageID = root.RightmostChild
+	return nil
+}
+
+func (bt *BTree) handleUnderflow(pageID pager.PageID, breadcrumbs *BTStack) error {
+	if breadcrumbs.isEmpty() {
+		// root underflow -- promote root's rightmostchild to root
+		return bt.handleRootUnderflow(pageID)
+	}
+
+	bc, err := breadcrumbs.pop()
+	if err != nil {
+		// should never occur since we checked for an empty stack already
+		return err
+	}
+
+	parent, err := bt.loadNode(bc.PageID)
+	if err != nil {
+		// error loading the node
+		return err
+	}
+
+	underflowNode, err := bt.loadNode(pageID)
+	if err != nil {
+		return err
+	}
+
+	var siblingID pager.PageID
+	var separatorIndex int
+	var mergeIntoSibling bool // true = we get merged into left, false = right merged into us
+
+	// try left sibling first
+	leftSiblingID, leftSepIdx, hasLeft := bt.findLeftSibling(parent, bc.Index)
+
+	if hasLeft {
+		siblingID = leftSiblingID
+		separatorIndex = leftSepIdx
+		mergeIntoSibling = true
+	} else {
+		// right will only be used if no left
+		rightSiblingID, rightSepIdx, hasRight := bt.findRightSibling(parent, bc.Index)
+		if hasRight {
+			siblingID = rightSiblingID
+			separatorIndex = rightSepIdx
+			mergeIntoSibling = false
+		} else {
+			return fmt.Errorf("node has no siblings to merge with")
+		}
+	}
+
+	sibling, err := bt.loadNode(siblingID)
+	if err != nil {
+		return err
+	}
+
+	// check if merge is possible (skip if too large)
+	if !sibling.CanMergeWith(underflowNode.SlottedPage) {
+		return nil // no merge occurs (this can be optimized later with "borrowing" or rebalances)
+	}
+
+	// perform merge based on node type
+	if underflowNode.IsLeaf() {
+		err = bt.mergeLeafNodes(sibling, underflowNode, parent, separatorIndex, mergeIntoSibling)
+	} else {
+		err = bt.mergeInternalNodes(sibling, underflowNode, parent, separatorIndex, mergeIntoSibling)
+	}
+
+	if err != nil {
+		// error with merge
+		return err
+	}
+
+	// CRITICAL: Write parent BEFORE checking underflow
+	// Parent has updated child pointers that must be persisted
+	if err := bt.writeNode(parent); err != nil {
+		return err
+	}
+
+	// check if parent is now underfull
+	if parent.IsUnderfull() {
+		return bt.handleUnderflow(parent.PageID, breadcrumbs)
+	}
+
+	return nil
+}
+
+func (bt *BTree) Delete(key uint64) error {
+	breadcrumbs := &BTStack{}
+	defer func() {
+		// we were writing stale headers. This will ensure that it's up to date before writing to the disk
+		bt.Header.NumPages = uint32(bt.Header.NextPageID - 1)
+		bt.dm.SetHeader(*bt.Header)
+		bt.dm.WriteHeader()
+		bt.dm.Sync() // flush all buffered writes to disk
+	}()
+	// traverse to leaf, collecting breadcrumbs
+	leafPageID, err := bt.findLeaf(key, breadcrumbs)
+	if err != nil {
+		return err
+	}
+	leaf, err := bt.loadNode(leafPageID)
+	if err != nil {
+		return err
+	}
+	idx, present := leaf.Search(key)
+	if !present {
+		return fmt.Errorf("key %d was not found", key)
+	}
+	err = leaf.DeleteRecord(idx)
+	if err != nil {
+		return err
+	}
+
+	// It was working when I commented out the merge. I think the node needs to write before starting the merge
+	if err := bt.writeNode(leaf); err != nil {
+		return err
+	}
+
+	// check if nodes need to merge
+	if leaf.IsUnderfull() {
+		return bt.handleUnderflow(leafPageID, breadcrumbs)
+	}
+	return bt.writeNode(leaf)
 }
 
 type BNode struct {

@@ -90,6 +90,8 @@ func (bts *BTreeStore) Insert(record schema.Record) error {
 }
 
 func (bts *BTreeStore) Delete(key uint64) error {
+	// need to flush the cache. After massive delete test SELECT still shows results
+	// until I exit and try again
 	bts.mu.Lock()
 	defer bts.mu.Unlock()
 

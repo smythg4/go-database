@@ -12,10 +12,11 @@ A handrolled database implementation in Go with multi-client TCP server support,
 
 **btree_store.go** - Primary storage implementation using B+ tree (current backend):
 - `BTreeStore`: Thin wrapper around B+ tree with schema-aware operations
-- Implements same interface as legacy TableStore (Insert, Find, ScanAll)
-- `sync.RWMutex` for concurrent access protection (Insert uses Lock, Find/ScanAll use RLock)
+- Implements full CRUD interface (Insert, Find, Delete, ScanAll)
+- `sync.RWMutex` for concurrent access protection (Insert/Delete use Lock, Find/ScanAll use RLock)
 - Key methods:
   - `Insert(record)`: Extracts first field as uint64 key, serializes record, calls bt.Insert
+  - `Delete(key uint64)`: Deletes record from tree, may trigger merges
   - `Find(id)`: Searches B+ tree via bt.Search, deserializes result
   - `ScanAll()`: Full table scan via bt.RangeScan(0, MaxUint64), deserializes all records
   - `Schema()`: Returns read-only schema from bt.Header.Schema
@@ -54,9 +55,11 @@ A handrolled database implementation in Go with multi-client TCP server support,
 **commands.go** - Command implementations:
 - Table cache: `GetOrOpenTable(filename)` ensures single BTreeStore instance per file (critical for mutex to work)
 - Commands write to `io.Writer` parameter, return errors
-- SQL-like: `create`, `use`, `show`, `insert`, `select [id]`, `stats`
-- Dynamic schema: INSERT/SELECT adapt to current table's field definitions
+- SQL-like: `create`, `use`, `show`, `insert`, `select [id]`, `delete <id>`, `update <values>`, `stats`
+- Dynamic schema: INSERT/SELECT/UPDATE adapt to current table's field definitions
 - Formatted output: Column-aligned tables with field names as headers
+- `delete <id>`: Finds record by key, displays it, then calls Delete (with merge support)
+- `update <values>`: Naive implementation using DELETE + INSERT (shows record being updated)
 - `stats` command: Shows tree structure (root page ID, type, NextPageID allocation)
 
 ### B+ Tree Storage Engine (`internal/pager` + `internal/btree`)
@@ -69,9 +72,13 @@ A handrolled database implementation in Go with multi-client TCP server support,
   - 4KB fixed page size (PAGE_SIZE = 4096)
 - Key methods:
   - `InsertRecordSorted`: Binary search insertion maintaining key order
+  - `DeleteRecord`: Tombstone approach (mark Offset=0) then immediate Compact
   - `Search`: Binary search for exact key match in leaf nodes
   - `SearchInternal`: Routes search to correct child page in internal nodes
   - `SplitLeaf/SplitInternal`: Node splitting with promoted key handling and child pointer updates
+  - `MergeLeaf/MergeInternals`: Combine two nodes (updates NextLeaf chain for leaves)
+  - `CanMergeWith`: Check if two pages fit together (combined size + slot overhead ≤ PAGE_SIZE)
+  - `IsUnderfull`: Returns true if GetUsedSpace() < PAGE_SIZE/2
   - `Compact`: Removes deleted record gaps by repacking active records
   - `Serialize/Deserialize`: Convert between in-memory (13-byte header) and disk ([4096]byte array)
 - Record formats:
@@ -89,7 +96,8 @@ A handrolled database implementation in Go with multi-client TCP server support,
 **Disk I/O (`internal/pager/disk_manager.go`)**:
 - `ReadPage/WritePage`: Load/store raw Page at offset (pageID * PAGE_SIZE)
 - `ReadSlottedPage/WriteSlottedPage`: High-level wrappers with serialization
-- `ReadHeader/WriteHeader`: Table metadata at offset 0
+- `ReadHeader/WriteHeader`: Table metadata at offset 0 (WriteHeader calls Sync())
+- `Sync()`: Flushes OS buffers to disk (critical for durability)
 
 **B-Tree Orchestration (`internal/btree/btree.go`)**:
 - `BTree`: Manages tree structure via DiskManager and TableHeader
@@ -97,13 +105,22 @@ A handrolled database implementation in Go with multi-client TCP server support,
 - `NewBTree(dm, header)`: Constructor for creating BTree with unexported fields
 - Key algorithms:
   - `Insert`: Uses breadcrumb stack to track descent path, handles splits bottom-up
-    - **Critical**: Defer pattern syncs header back to DM: `defer func() { bt.dm.SetHeader(*bt.Header); bt.dm.WriteHeader() }()`
+    - **Critical**: Defer pattern syncs header and calls Sync(): `defer func() { bt.dm.SetHeader(*bt.Header); bt.dm.WriteHeader(); bt.dm.Sync() }()`
+  - `Delete`: Traverses to leaf, deletes record, writes leaf BEFORE checking underflow, handles merges
+    - **Critical**: Same defer pattern as Insert for header sync
+    - Writes modified leaf before underflow check to ensure durability
   - `propagateSplit`: Inserts promoted keys into parents, cascades splits up tree
   - `handleRootSplit`: Creates new internal root when root overflows (tree height growth)
+  - `handleUnderflow`: Detects underflow, finds sibling, attempts merge, recurses on parent underflow
+    - **Critical**: Writes parent BEFORE checking parent underflow (prevents stale parent pointers)
+  - `handleRootUnderflow`: Collapses root when internal root has NumSlots=0 (only RightmostChild remains)
+  - `mergeLeafNodes/mergeInternalNodes`: Combines siblings, updates parent pointers
+    - Internal merge demotes separator key: `SerializeInternalRecord(separatorKey, leftNode.RightmostChild)`
+  - `findLeftSibling/findRightSibling`: Navigates parent to locate merge partners
   - `Search`: Descends tree using SearchInternal/Search, max depth check prevents infinite loops
-  - `RangeScan`: Follows NextLeaf sibling chain for efficient range queries
+  - `RangeScan`: Follows NextLeaf sibling chain with cycle detection
   - `Stats()`: Debug helper showing root page ID, type, NextPageID allocation
-- Breadcrumb stack pattern (from Petrov): Tracks PageID path during descent for split propagation
+- Breadcrumb stack pattern (from Petrov): Tracks PageID and child index during descent for split/merge propagation
 - Child pointer management: After inserting promoted key at position i, updates record[i+1] or RightmostChild
 
 **Critical Implementation Details:**
@@ -205,45 +222,41 @@ B+ tree page-based storage is **completed and fully integrated** with the CLI:
 - ✅ Header durability fix (sync BTree changes back to DiskManager)
 - ✅ Stress testing with 150 inserts verified multi-level tree growth
 
-**Next Up: DELETE Implementation Roadmap**
+**✅ DELETE & MERGE Implementation (COMPLETED)**
 
-**Phase 1 - Basic DELETE (immediate priority):**
-- Find key in leaf via tree traversal
-- Remove record from leaf node
-- Compact page to reclaim space
-- No underflow handling yet (tree may become sparse)
-- CLI: `delete <id>` command
+**Phase 1 - DELETE with Merge Support:**
+- ✅ Tree traversal to find key in leaf
+- ✅ Record removal with tombstone + immediate compact pattern
+- ✅ Underflow detection (`IsUnderfull()` checks if used space < PAGE_SIZE/2)
+- ✅ Leaf node merging when siblings can fit together
+- ✅ Internal node merging with separator key demotion
+- ✅ Parent pointer updates after DeleteRecord (slots shift down)
+- ✅ Recursive underflow propagation up the tree
+- ✅ Root collapse when internal root has only RightmostChild
+- ✅ Durability: `Sync()` after all DELETE operations
+- ✅ CLI: `delete <id>` and `update <values>` commands
 
-**Phase 2 - Space Reuse:**
-- Track partially-full pages (free space map in header or separate structure)
-- On INSERT, check free space map before allocating new pages
-- Prevents unbounded tree growth after delete/insert cycles
-- Optional: Track FreeSpacePtr per page in metadata
+**Critical Bugs Fixed:**
+- ✅ **Parent write before recursion**: Parent updates must be persisted BEFORE recursive underflow handling, otherwise stale parent pointers point to orphaned pages
+- ✅ **Leaf write before underflow check**: Modified leaf must be written to disk BEFORE checking underflow (same pattern as parent fix)
+- ✅ **Cycle detection in RangeScan**: Detects corrupted leaf chains that visit pages twice
+- ✅ **Missing fsync**: Added `DiskManager.Sync()` and called after Insert/Delete to flush OS buffers
 
-**Phase 3 - Merge/Borrow (advanced):**
-- Check underflow: `FreeSpacePtr < PAGE_SIZE/2` after delete
-- Attempt merge: If sibling + current page fit in one page, merge them
-- Attempt borrow: If merge impossible, redistribute keys with sibling
-- Update parent pointers after merge/borrow
-- Handle root collapse when root has only one child
+**Merge Algorithm Details:**
+- Prefers merging with left sibling (right into left) for consistency
+- Falls back to right sibling if no left sibling exists
+- Skips merge if combined size > PAGE_SIZE (accepts fragmentation in Phase 1)
+- **Leaf merge**: Updates NextLeaf chain (`merged.NextLeaf = orphaned.NextLeaf`)
+- **Internal merge**: Demotes separator key into merged node (`SerializeInternalRecord(separatorKey, leftNode.RightmostChild)`)
+- **Parent updates**: After `DeleteRecord(separatorIndex)`, slots shift - must update pointer at new `separatorIndex` position
 
-**Phase 4 - Durability (requires Petrov Ch 4-5):**
-- Page checksums (CRC32/XXHash) for corruption detection
-- Write-Ahead Logging (WAL) for crash recovery
-- ARIES-style recovery (Analysis, Redo, Undo)
-- Transaction support (BEGIN, COMMIT, ROLLBACK)
-
-**Phase 5 - Optimization:**
-- Background compaction (VACUUM-like operation)
-- Auto-defragmentation of sparse pages
+**Phase 2 - Future Enhancements:**
+- Node borrowing/redistribution (when merge impossible due to size)
+- Free space tracking for space reuse (orphaned pages currently not reclaimed)
 - Buffer pool for page caching (reduce disk I/O)
-- Query optimizer (beyond simple point lookups)
-
-**Longer-term enhancements:**
 - Support non-int primary keys via hashing (currently first field must be int32)
-- Secondary indices (additional B+ trees on other fields)
-- JOIN operations
-- Distributed replication (Raft consensus from Petrov Part 2)
+- Transaction support with ACID guarantees (WAL, ARIES recovery)
+- Background compaction (VACUUM-like operation to reclaim orphaned pages)
 
 ## Learning-Focused Interaction Guidelines
 

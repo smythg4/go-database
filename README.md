@@ -8,7 +8,8 @@ A from-scratch database implementation in Go, built to answer the question: 'How
 - **Page-Based Disk Format** - 4KB slotted pages with binary serialization
 - **Multi-Client TCP Server** - Concurrent connections on port 42069
 - **Dynamic Schema System** - User-defined tables with custom field types
-- **SQL-like Interface** - CREATE, INSERT, SELECT, DELETE with primary key constraints
+- **SQL-like Interface** - CREATE, INSERT, SELECT, UPDATE, DELETE with primary key constraints
+- **Node Merging** - Automatic page merging when nodes become underfull after deletion
 - **Type Support** - int32, string, bool, float64, date (ISO 8601)
 - **Primary Key Uniqueness** - Duplicate key detection with PostgreSQL-style errors
 - **Interactive REPL** - Local command-line interface + network clients
@@ -17,7 +18,8 @@ A from-scratch database implementation in Go, built to answer the question: 'How
 ## Points of Pride
 - **500 concurrent inserts, zero corruption** - Stress tested with 5 concurrent TCP clients, all 5 data types, multi-level tree growth. RWMutex protection actually works.
 - **Breadcrumb stack for split propogation** - Implemented Petrov's breadcrumb pattern for bottom-up split cascading. Took 3 tries to get child pointer updates right.
-- **Full CRUD operations** - CREATE, INSERT, SELECT, DELETE all working with proper error handling and persistence.
+- **Full CRUD operations** - CREATE, INSERT, SELECT, UPDATE, DELETE all working with proper error handling and persistence.
+- **Write-before-recursion pattern** - Critical durability insight: write nodes before checking underflow to prevent stale pointers. Appears at both leaf and parent levels.
 
 ## Quick Start
 
@@ -127,6 +129,7 @@ Switching to table: products
 | `insert <values...>` | Insert record (errors on duplicate key) | `insert 1 alice 1990-05-15` |
 | `select` | Scan all records | `select` |
 | `select <id>` | Point lookup by ID (O(log n)) | `select 5` |
+| `update <values...>` | Update record (DELETE + INSERT) | `update 5 bob 1992-03-20` |
 | `delete <id>` | Delete record by ID (O(log n)) | `delete 5` |
 | `stats` | Show tree structure (root page, type, NextPageID) | `stats` |
 | `.help` | Show help | `.help` |
@@ -199,8 +202,8 @@ Example hexdump showing header with B+ tree metadata:
 
 ## Current Limitations
 
-- **No UPDATE command**: Use DELETE + INSERT for modifications
-- **No node merging/rebalancing**: DELETE removes records but doesn't merge sparse pages (tree may become fragmented)
+- **UPDATE uses DELETE + INSERT**: Not true in-place modification (functional but not optimal)
+- **No borrowing during rebalance**: Merge-only strategy may cause fragmentation in some cases
 - **Primary key must be int32**: First field in schema must be int32 type
 - **No transactions**: Operations commit immediately, no rollback support
 - **No buffer pool**: Every page read/write hits disk (future optimization)
@@ -220,18 +223,22 @@ The storage engine uses a fully functional B+ tree with the following characteri
 **✅ Core Operations:**
 - **Insert** - O(log n) insertion with duplicate key detection (PostgreSQL-style error), automatic splitting, and cascading propagation
 - **Search** - O(log n) point queries with multi-level tree traversal (max depth 100)
-- **Delete** - O(log n) deletion with tree traversal and record removal (Phase 1: no merge/rebalance)
-- **RangeScan** - O(log n + k) range queries using sibling pointer chain across leaf nodes
+- **Delete** - O(log n) deletion with tombstone pattern, automatic merging when underfull, and bottom-up cascade
+- **RangeScan** - O(log n + k) range queries using sibling pointer chain across leaf nodes with cycle detection
 - **Stats** - Debug helper showing root page ID, node type (LEAF/INTERNAL), and NextPageID allocation
 
 **Key Implementation Details:**
 - **Slotted pages** - 4KB fixed pages with 13-byte headers, slot arrays growing downward, records growing upward
 - **Binary search** - Sorted insertion and lookup within pages
-- **Breadcrumb stack** - Tracks descent path for bottom-up split propagation (pattern from Petrov's "Database Internals")
+- **Breadcrumb stack** - Tracks descent path for bottom-up split/merge propagation (pattern from Petrov's "Database Internals")
 - **Sibling pointers** - Leaf nodes linked for efficient range scans (B+ tree characteristic)
 - **Child pointer management** - After inserting promoted key at index i, updates record[i+1] or RightmostChild
 - **Header durability** - Defer pattern syncs BTree header changes (RootPageID, NextPageID) back to DiskManager before write
 - **Primary key uniqueness** - Search before insert, error on duplicate key (PostgreSQL-style behavior)
+- **Tombstone deletion** - DeleteRecord() marks slot as empty (Offset=0), then Compact() removes gaps
+- **Merge strategy** - Prefer left sibling, merge left-into-right, demote separator key for internal nodes
+- **Write-before-recursion** - Critical pattern: write leaf before checking underflow, write parent before checking parent underflow
+- **Root collapse** - When internal root has only RightmostChild, promote it to new root
 
 **Test Coverage:**
 - Insert without split (single leaf)
@@ -243,12 +250,12 @@ The storage engine uses a fully functional B+ tree with the following characteri
 - Stress testing: 150 inserts verified multi-level tree growth
 
 **Future Enhancements:**
-- Node merging/borrowing after DELETE (prevent tree fragmentation)
+- Node borrowing (currently merge-only, no borrowing from siblings)
 - Free space tracking for space reuse after deletes
 - Buffer pool for page caching (reduce disk I/O)
 - Support non-int primary keys via hashing (currently first field must be int32)
 - Transaction support with ACID guarantees (WAL, ARIES recovery)
-- UPDATE command (currently DELETE + INSERT)
+- True in-place UPDATE (currently uses DELETE + INSERT pattern)
 - Background compaction (VACUUM-like operation)
 
 ## Project Goals

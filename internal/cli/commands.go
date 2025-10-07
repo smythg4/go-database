@@ -108,6 +108,11 @@ func init() {
 			Description: "Delete a record from the active table by primary key - usage: delete <id>",
 			Callback:    commandDelete,
 		},
+		"update": {
+			Name:        "update",
+			Description: "Update a record from the active table - usage: update <value1> <value2> ...",
+			Callback:    commandUpdate,
+		},
 		"stats": {
 			Name:        "stats",
 			Description: "Display B+ tree statistics for the active table (root page, type, page count)",
@@ -240,6 +245,34 @@ func commandDelete(config *DatabaseConfig, params []string, w io.Writer) error {
 
 	fmt.Fprintf(w, "Deleting %+v from table %s\n", record, config.TableS.Schema().TableName)
 	return config.TableS.Delete(uint64(key))
+}
+
+func commandUpdate(config *DatabaseConfig, params []string, w io.Writer) error {
+	// this is a naive implementation of UPDATE. It just DELETES then INSERTS.
+	// we can make a true mutable UPDATE later.
+	fieldCount := len(config.TableS.Schema().Fields)
+
+	if len(params) != fieldCount {
+		return fmt.Errorf("need %d parameters for fields: %v", fieldCount, config.TableS.Schema().GetFieldNames())
+	}
+
+	record := make(schema.Record)
+	for i, field := range config.TableS.Schema().Fields {
+		// parse params[i] according to field.type
+		value, err := schema.ParseValue(params[i], field.Type)
+		if err != nil {
+			return fmt.Errorf("invalid value for %s: %v", field.Name, err)
+		}
+		record[field.Name] = value
+	}
+	fmt.Fprintf(w, "Updating %+v in table %s\n", record, config.TableS.Schema().TableName)
+	firstField := config.TableS.Schema().Fields[0].Name
+	key := record[firstField].(int32)
+	err := config.TableS.Delete(uint64(key))
+	if err != nil {
+		return err
+	}
+	return config.TableS.Insert(record)
 }
 
 func commandInsert(config *DatabaseConfig, params []string, w io.Writer) error {
