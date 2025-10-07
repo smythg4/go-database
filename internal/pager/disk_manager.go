@@ -64,7 +64,10 @@ func (dm *DiskManager) ReadPage(pageID PageID) (Page, error) {
 func (dm *DiskManager) WritePage(page Page) error {
 	offset := int64(page.PageID) * PAGE_SIZE
 	_, err := dm.file.WriteAt(page.Data[:], offset)
-	return err
+	if err != nil {
+		return err
+	}
+	return dm.file.Sync()
 }
 
 func (dm *DiskManager) ReadSlottedPage(pageID PageID) (*SlottedPage, error) {

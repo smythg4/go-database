@@ -18,7 +18,8 @@ A from-scratch database implementation in Go, built to answer the question: 'How
 
 ## Points of Pride
 - **3,538x faster lookups** - Benchmarked against legacy append-only storage: 6.9μs vs 24ms for 10,000 record lookups. O(log n) vs O(n) in action.
-- **500 concurrent inserts, zero corruption** - Stress tested with 5 concurrent TCP clients, all 5 data types, multi-level tree growth. RWMutex protection actually works.
+- **5,000 concurrent inserts, zero corruption** - Stress tested with 5 concurrent TCP clients hammering the database simultaneously. All data persists correctly.
+- **Caught catastrophic durability bug** - Stress testing revealed 100% data loss on restart. Pages written to OS buffer but never synced to disk. Fixed by adding `Sync()` to `WritePage()`. 5,000 records now survive restart.
 - **Breadcrumb stack for split propogation** - Implemented Petrov's breadcrumb pattern for bottom-up split cascading. Took 3 tries to get child pointer updates right.
 - **Full CRUD operations** - CREATE, INSERT, SELECT, UPDATE, DELETE all working with proper error handling and persistence.
 - **Write-before-recursion pattern** - Critical durability insight: write nodes before checking underflow to prevent stale pointers. Appears at both leaf and parent levels.

@@ -2,6 +2,8 @@
   # stress_test.sh
 
   {
+      echo "drop stress"
+      sleep 0.2
       echo "create stress id:int data:string value:float"
       echo "use stress"
 

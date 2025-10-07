@@ -92,7 +92,7 @@ func main() {
 	go func() {
 		<-sigCh
 		fmt.Println("\nShutting down gracefully...")
-		_ = cli.CommandRegistry["exit"].Callback(config, []string{}, os.Stdout)
+		_ = cli.CommandRegistry[".exit"].Callback(config, []string{}, os.Stdout)
 		os.Exit(0)
 	}()
 

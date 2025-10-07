@@ -126,6 +126,11 @@ func init() {
 			Description: "Show B+ tree statistics (root page, type, page count)",
 			Callback:    commandStats,
 		},
+		"drop": {
+			Name:        "drop",
+			Description: "Delete the underlying table - usage: drop | <tablename>",
+			Callback:    commandDrop,
+		},
 	}
 }
 
@@ -145,6 +150,21 @@ func fieldString(typ schema.FieldType) (string, error) {
 		return "", fmt.Errorf("type not found: %v", typ)
 	}
 
+}
+
+func commandDrop(config *DatabaseConfig, params []string, w io.Writer) error {
+	if len(params) != 1 {
+		return fmt.Errorf("need at least one parameter, actual: %d", len(params))
+	}
+	tName := params[0]
+	fName := tName + ".db"
+	fmt.Fprintf(w, "Dropping table %s...\n", tName)
+	err := os.Remove(fName)
+	if err != nil && !os.IsNotExist(err) {
+		return err
+	}
+	fmt.Fprintf(w, "Dropped table %s\n", tName)
+	return nil
 }
 
 func commandDescribe(config *DatabaseConfig, params []string, w io.Writer) error {
