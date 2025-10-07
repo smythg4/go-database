@@ -1,6 +1,6 @@
 # Go-Database
 
-A handrolled database implementation in Go, built from scratch as a learning project to understand database internals.
+A from-scratch database implementation in Go, built to answer the question: 'How does this actually work?' Spoiler: slotted pages, breadcrumb stacks, and more off-by-one errors than I'd like to admit.
 
 ## Features
 
