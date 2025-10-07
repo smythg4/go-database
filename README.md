@@ -9,7 +9,8 @@ A handrolled database implementation in Go, built from scratch as a learning pro
 - **Multi-Client TCP Server** - Concurrent connections on port 42069
 - **Dynamic Schema System** - User-defined tables with custom field types
 - **SQL-like Interface** - CREATE TABLE, INSERT, SELECT with primary key constraints
-- **Type Support** - int32, string, bool, float64 (IEEE 754 encoding)
+- **Type Support** - int32, string, bool, float64, date (ISO 8601)
+- **Primary Key Uniqueness** - Duplicate key detection with PostgreSQL-style errors
 - **Interactive REPL** - Local command-line interface + network clients
 - **Range Scans** - Efficient range queries via leaf node sibling pointers
 
@@ -61,15 +62,26 @@ Go-DB [products]> select 2
 Go-DB [products]> insert 2 keyboard 79.99 100
 Error: key 2 already exists
 
-Go-DB [products]> stats
+Go-DB [products]> create employees id:int name:string birthdate:date
+New table created: employees
+
+Go-DB [employees]> insert 1 alice 1985-06-15
+Inserting map[birthdate:487900800 id:1 name:alice] into table employees
+
+Go-DB [employees]> select
+| id   | name     | birthdate  |
+----------------------------------------
+| 1    | alice    | 1985-06-15 |
+
+Go-DB [employees]> stats
 Root: page 1, Type: 0, NextPageID: 2, NumPages: 1
 
-Go-DB [products]> show
+Go-DB [employees]> show
 products
-users
+employees
 
-Go-DB [products]> use users
-Switching to table: users
+Go-DB [employees]> use products
+Switching to table: products
 ```
 
 ## Architecture
@@ -96,15 +108,22 @@ Switching to table: users
 
 | Command | Description | Example |
 |---------|-------------|---------|
-| `create <table> <field:type> ...` | Create new table (first field = primary key) | `create users id:int name:string age:int` |
+| `create <table> <field:type> ...` | Create new table (first field = primary key) | `create users id:int name:string birthdate:date` |
 | `use <table>` | Switch active table | `use products` |
 | `show` | List all tables | `show` |
-| `insert <values...>` | Insert record (errors on duplicate key) | `insert 1 alice 30` |
+| `insert <values...>` | Insert record (errors on duplicate key) | `insert 1 alice 1990-05-15` |
 | `select` | Scan all records | `select` |
 | `select <id>` | Point lookup by ID (O(log n)) | `select 5` |
 | `stats` | Show tree structure (root page, type, NextPageID) | `stats` |
 | `.help` | Show help | `.help` |
 | `.exit` | Exit the database | `.exit` |
+
+**Supported Types:**
+- `int` - 32-bit signed integer
+- `string` - Variable-length UTF-8 string
+- `bool` - Boolean (true/false)
+- `float` - 64-bit IEEE 754 floating point
+- `date` - Date in ISO 8601 format (YYYY-MM-DD), stored as Unix timestamp
 
 ## Network Protocol
 
@@ -132,7 +151,7 @@ Tables are stored as `.db` files with page-based B+ tree structure:
     - Field count (uint32)
     - For each field:
       - Field name (length-prefixed string)
-      - Field type (1 byte: 0=int, 1=string, 2=bool, 3=float)
+      - Field type (1 byte: 0=int, 1=string, 2=bool, 3=float, 4=date)
 
 [Page 1+: Slotted Pages - 4KB each]
   Header (13 bytes):
@@ -154,6 +173,7 @@ Tables are stored as `.db` files with page-based B+ tree structure:
     - string: 4-byte length + UTF-8 bytes
     - bool: 1 byte (0/1)
     - float64: 8 bytes (IEEE 754 via math.Float64bits)
+    - date: 8 bytes (Unix timestamp as int64, displayed as YYYY-MM-DD UTC)
 ```
 
 Example hexdump showing header with B+ tree metadata:
@@ -183,7 +203,7 @@ This project follows concepts from:
 The storage engine uses a fully functional B+ tree with the following characteristics:
 
 **✅ Core Operations:**
-- **Insert** - O(log n) insertion with duplicate key detection, automatic splitting, and cascading propagation
+- **Insert** - O(log n) insertion with duplicate key detection (PostgreSQL-style error), automatic splitting, and cascading propagation
 - **Search** - O(log n) point queries with multi-level tree traversal (max depth 100)
 - **RangeScan** - O(log n + k) range queries using sibling pointer chain across leaf nodes
 - **Stats** - Debug helper showing root page ID, node type (LEAF/INTERNAL), and NextPageID allocation

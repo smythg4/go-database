@@ -286,12 +286,12 @@ func commandSelect(config *DatabaseConfig, params []string, w io.Writer) error {
 	fmt.Fprintln(w)
 	fmt.Fprintln(w, strings.Repeat("-", len(fieldNames)*20))
 
-	id, err := strconv.Atoi(params[0])
+	key, err := strconv.Atoi(params[0])
 	if err != nil {
 		return err
 	}
 
-	record, err := config.TableS.Find(id)
+	record, err := config.TableS.Find(key)
 
 	fmt.Fprint(w, "| ")
 	for i, field := range config.TableS.Schema().Fields {

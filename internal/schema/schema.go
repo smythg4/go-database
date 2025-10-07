@@ -7,6 +7,7 @@ import (
 	"godb/internal/encoding"
 	"io"
 	"strconv"
+	"time"
 )
 
 type FieldType int
@@ -16,6 +17,7 @@ const (
 	StringType
 	BoolType
 	FloatType
+	DateType
 )
 
 func ParseFieldType(s string) (FieldType, error) {
@@ -28,6 +30,8 @@ func ParseFieldType(s string) (FieldType, error) {
 		return BoolType, nil
 	case "float":
 		return FloatType, nil
+	case "date":
+		return DateType, nil
 	default:
 		return 0, fmt.Errorf("unknown type: %s", s)
 	}
@@ -51,6 +55,13 @@ func ParseValue(s string, fieldType FieldType) (any, error) {
 		return val, nil
 	case FloatType:
 		val, err := strconv.ParseFloat(s, 64)
+		if err != nil {
+			return nil, err
+		}
+		return val, nil
+	case DateType:
+		t, err := time.Parse("2006-01-02", s)
+		val := t.Unix()
 		if err != nil {
 			return nil, err
 		}
@@ -224,6 +235,9 @@ func writeFieldValue(w io.Writer, fieldType FieldType, value any) error {
 	case FloatType:
 		f := value.(float64)
 		return encoding.WriteFloat64(w, f)
+	case DateType:
+		v := value.(int64)
+		return encoding.WriteInt64(w, v)
 	default:
 		return fmt.Errorf("unsupported type: %v", fieldType)
 	}
@@ -242,6 +256,13 @@ func readFieldValue(r io.Reader, fieldType FieldType) (any, error) {
 		return buf[0] != 0, err
 	case FloatType:
 		return encoding.ReadFloat64(r)
+	case DateType:
+		unixTimestamp, err := encoding.ReadInt64(r)
+		if err != nil {
+			return nil, err
+		}
+		t := time.Unix(unixTimestamp, 0)
+		return t.UTC().Format("2006-01-02"), nil
 	default:
 		return nil, fmt.Errorf("unsupported type: %v", fieldType)
 	}

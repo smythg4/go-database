@@ -20,6 +20,20 @@ func ReadUint32(r io.Reader) (uint32, error) {
 	}
 	return binary.LittleEndian.Uint32(buf), nil
 }
+func WriteInt64(w io.Writer, v int64) error {
+	buf := make([]byte, 8)
+	binary.LittleEndian.PutUint64(buf, uint64(v))
+	_, err := w.Write(buf)
+	return err
+}
+func ReadInt64(r io.Reader) (int64, error) {
+	buf := make([]byte, 8)
+	_, err := io.ReadFull(r, buf)
+	if err != nil {
+		return 0, err
+	}
+	return int64(binary.LittleEndian.Uint64(buf)), nil
+}
 func WriteString(w io.Writer, s string) error {
 	if err := WriteUint32(w, uint32(len(s))); err != nil {
 		return err

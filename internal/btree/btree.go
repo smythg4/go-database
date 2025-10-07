@@ -142,6 +142,7 @@ func (bt *BTree) Insert(key uint64, data []byte) error {
 	breadcrumbs := &BTStack{}
 	defer func() {
 		// we were writing stale headers. This will ensure that it's up to date before writing to the disk
+		bt.Header.NumPages = uint32(bt.Header.NextPageID - 1)
 		bt.dm.SetHeader(*bt.Header)
 		bt.dm.WriteHeader()
 	}()
