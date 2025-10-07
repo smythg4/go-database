@@ -14,6 +14,10 @@ A from-scratch database implementation in Go, built to answer the question: 'How
 - **Interactive REPL** - Local command-line interface + network clients
 - **Range Scans** - Efficient range queries via leaf node sibling pointers
 
+## Points of Pride
+- **500 concurrent inserts, zero corruption** - Stress tested with 5 concurrent TCP clients, all 5 data types, multi-level tree growth. RWMutex protection actually works.
+- **Breadcrumb stack for split propogation** - Implemented Petrov's breadcrumb pattern for bottom-up split cascading. Took 3 tries to get child pointer updates right.
+
 ## Quick Start
 
 ```bash
