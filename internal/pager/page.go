@@ -168,13 +168,16 @@ func (sp *SlottedPage) GetRecord(slotIndex int) ([]byte, error) {
 }
 
 func (sp *SlottedPage) DeleteRecord(slotIndex int) error {
-	if slotIndex >= len(sp.Slots) {
+	// want to update to a tombstone approach where we just 0 values in sp.Slots
+	// compact will then clean it up. Will need to update GetKey, Search, etc to check
+	// if Offset == 0 and skip them
+	if slotIndex >= int(sp.NumSlots) {
 		return errors.New("slot out of range")
 	}
 
-	sp.Slots[slotIndex].Offset = 0
-	sp.Slots[slotIndex].Length = 0
-	sp.Records[slotIndex] = nil
+	sp.Records = append(sp.Records[:slotIndex], sp.Records[slotIndex+1:]...)
+	sp.Slots = append(sp.Slots[:slotIndex], sp.Slots[slotIndex+1:]...)
+	sp.NumSlots--
 
 	return nil
 }

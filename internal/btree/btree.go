@@ -138,6 +138,34 @@ func (bt *BTree) propogateSplit(promotedKey uint64, rightPageID, leftPageID page
 	return bt.handleRootSplit(promotedKey, leftPageID, rightPageID)
 }
 
+func (bt *BTree) Delete(key uint64) error {
+	breadcrumbs := &BTStack{}
+	defer func() {
+		// we were writing stale headers. This will ensure that it's up to date before writing to the disk
+		bt.Header.NumPages = uint32(bt.Header.NextPageID - 1)
+		bt.dm.SetHeader(*bt.Header)
+		bt.dm.WriteHeader()
+	}()
+	// traverse to leaf, collecting breadcrumbs
+	leafPageID, err := bt.findLeaf(key, breadcrumbs)
+	if err != nil {
+		return err
+	}
+	leaf, err := bt.loadNode(leafPageID)
+	if err != nil {
+		return err
+	}
+	idx, present := leaf.Search(key)
+	if !present {
+		return fmt.Errorf("key %d was not found", key)
+	}
+	err = leaf.DeleteRecord(idx)
+	if err != nil {
+		return err
+	}
+	return bt.writeNode(leaf)
+}
+
 func (bt *BTree) Insert(key uint64, data []byte) error {
 	breadcrumbs := &BTStack{}
 	defer func() {

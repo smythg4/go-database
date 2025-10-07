@@ -205,12 +205,45 @@ B+ tree page-based storage is **completed and fully integrated** with the CLI:
 - ✅ Header durability fix (sync BTree changes back to DiskManager)
 - ✅ Stress testing with 150 inserts verified multi-level tree growth
 
-**Future Enhancements (not urgent):**
-- Node merging/rebalancing after deletions
+**Next Up: DELETE Implementation Roadmap**
+
+**Phase 1 - Basic DELETE (immediate priority):**
+- Find key in leaf via tree traversal
+- Remove record from leaf node
+- Compact page to reclaim space
+- No underflow handling yet (tree may become sparse)
+- CLI: `delete <id>` command
+
+**Phase 2 - Space Reuse:**
+- Track partially-full pages (free space map in header or separate structure)
+- On INSERT, check free space map before allocating new pages
+- Prevents unbounded tree growth after delete/insert cycles
+- Optional: Track FreeSpacePtr per page in metadata
+
+**Phase 3 - Merge/Borrow (advanced):**
+- Check underflow: `FreeSpacePtr < PAGE_SIZE/2` after delete
+- Attempt merge: If sibling + current page fit in one page, merge them
+- Attempt borrow: If merge impossible, redistribute keys with sibling
+- Update parent pointers after merge/borrow
+- Handle root collapse when root has only one child
+
+**Phase 4 - Durability (requires Petrov Ch 4-5):**
+- Page checksums (CRC32/XXHash) for corruption detection
+- Write-Ahead Logging (WAL) for crash recovery
+- ARIES-style recovery (Analysis, Redo, Undo)
+- Transaction support (BEGIN, COMMIT, ROLLBACK)
+
+**Phase 5 - Optimization:**
+- Background compaction (VACUUM-like operation)
+- Auto-defragmentation of sparse pages
 - Buffer pool for page caching (reduce disk I/O)
+- Query optimizer (beyond simple point lookups)
+
+**Longer-term enhancements:**
 - Support non-int primary keys via hashing (currently first field must be int32)
-- Deletion operations (currently insert-only)
-- Transaction support with ACID guarantees
+- Secondary indices (additional B+ trees on other fields)
+- JOIN operations
+- Distributed replication (Raft consensus from Petrov Part 2)
 
 ## Learning-Focused Interaction Guidelines
 

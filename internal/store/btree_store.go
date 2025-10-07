@@ -89,6 +89,13 @@ func (bts *BTreeStore) Insert(record schema.Record) error {
 	return bts.bt.Insert(key, data)
 }
 
+func (bts *BTreeStore) Delete(key uint64) error {
+	bts.mu.Lock()
+	defer bts.mu.Unlock()
+
+	return bts.bt.Delete(key)
+}
+
 func (bts *BTreeStore) Find(key int) (schema.Record, error) {
 	bts.mu.RLock()
 	defer bts.mu.RUnlock()

@@ -65,47 +65,52 @@ var CommandRegistry map[string]CliCommand
 
 func init() {
 	CommandRegistry = map[string]CliCommand{
-		// add: DELETE, UPDATE, DROP
+		// add: UPDATE, DROP
 		// future: SELECT command parsing for ranges, INSERT command PRIMARY KEY and NOT NULL
 		//			CREATE database (right now it's just TABLE)
 		".help": {
 			Name:        ".help",
-			Description: "Displays a help message.",
+			Description: "Display available commands and usage information",
 			Callback:    commandHelp,
 		},
 		".exit": {
 			Name:        ".exit",
-			Description: "Exit the program",
+			Description: "Exit the database and close all connections",
 			Callback:    commandExit,
+		},
+		"create": {
+			Name:        "create",
+			Description: "Create a new table - usage: create <tablename> <field:type> ...",
+			Callback:    commandCreate,
+		},
+		"use": {
+			Name:        "use",
+			Description: "Switch to a different table - usage: use <tablename>",
+			Callback:    commandUse,
+		},
+		"show": {
+			Name:        "show",
+			Description: "List all available tables in the database",
+			Callback:    commandShow,
 		},
 		"insert": {
 			Name:        "insert",
-			Description: "Perform a SQL INSERT action",
+			Description: "Insert a new record into the active table - usage: insert <value1> <value2> ...",
 			Callback:    commandInsert,
 		},
 		"select": {
 			Name:        "select",
-			Description: "Perform a SQL SELECT action",
+			Description: "Query records from the active table - usage: select [id] (omit id for full scan)",
 			Callback:    commandSelect,
 		},
-		"show": {
-			Name:        "show",
-			Description: "Show all tables",
-			Callback:    commandShow,
-		},
-		"use": {
-			Name:        "use",
-			Description: "Select active table",
-			Callback:    commandUse,
-		},
-		"create": {
-			Name:        "create",
-			Description: "Create a new table -- CREATE tablename field1name:field1type field2name:field2type ...",
-			Callback:    commandCreate,
+		"delete": {
+			Name:        "delete",
+			Description: "Delete a record from the active table by primary key - usage: delete <id>",
+			Callback:    commandDelete,
 		},
 		"stats": {
 			Name:        "stats",
-			Description: "Get additional information about the active table",
+			Description: "Display B+ tree statistics for the active table (root page, type, page count)",
 			Callback:    commandStats,
 		},
 	}
@@ -216,6 +221,25 @@ func commandExit(config *DatabaseConfig, params []string, w io.Writer) error {
 		}
 	}
 	return nil
+}
+
+func commandDelete(config *DatabaseConfig, params []string, w io.Writer) error {
+
+	if len(params) != 1 {
+		return errors.New("must provide a primary key for deletion")
+	}
+
+	key, err := strconv.Atoi(params[0])
+	if err != nil {
+		return fmt.Errorf("error parsing primary key: %v", params[0])
+	}
+	record, err := config.TableS.Find(key)
+	if err != nil {
+		return fmt.Errorf("unable to find key: %d", key)
+	}
+
+	fmt.Fprintf(w, "Deleting %+v from table %s\n", record, config.TableS.Schema().TableName)
+	return config.TableS.Delete(uint64(key))
 }
 
 func commandInsert(config *DatabaseConfig, params []string, w io.Writer) error {
