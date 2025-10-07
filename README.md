@@ -8,8 +8,9 @@ A from-scratch database implementation in Go, built to answer the question: 'How
 - **Page-Based Disk Format** - 4KB slotted pages with binary serialization
 - **Multi-Client TCP Server** - Concurrent connections on port 42069
 - **Dynamic Schema System** - User-defined tables with custom field types
-- **SQL-like Interface** - CREATE, INSERT, SELECT, UPDATE, DELETE, DESCRIBE, COUNT with primary key constraints
+- **SQL-like Interface** - CREATE, INSERT, SELECT, UPDATE, DELETE, DESCRIBE, COUNT, DROP with primary key constraints
 - **Node Merging** - Automatic page merging when nodes become underfull after deletion
+- **Free Page List** - Orphaned pages from merges are tracked and reused, preventing file growth
 - **Range Queries** - Efficient range scans with O(log n + k) complexity via leaf sibling pointers
 - **Type Support** - int32, string, bool, float64, date (ISO 8601)
 - **Primary Key Uniqueness** - Duplicate key detection with PostgreSQL-style errors
@@ -19,6 +20,8 @@ A from-scratch database implementation in Go, built to answer the question: 'How
 ## Points of Pride
 - **3,538x faster lookups** - Benchmarked against legacy append-only storage: 6.9μs vs 24ms for 10,000 record lookups. O(log n) vs O(n) in action.
 - **5,000 concurrent inserts, zero corruption** - Stress tested with 5 concurrent TCP clients hammering the database simultaneously. All data persists correctly.
+- **Chaos testing with concurrent deletes** - 5 clients running interleaved inserts and deletes (2,500 inserts, 1,017 deletes) with zero corruption. Free page list verified working.
+- **Zero file growth from page reuse** - After chaos test, inserting 501 new records consumed 0 new pages (all reused from free list). NextPageID growth: 0.
 - **Caught catastrophic durability bug** - Stress testing revealed 100% data loss on restart. Pages written to OS buffer but never synced to disk. Fixed by adding `Sync()` to `WritePage()`. 5,000 records now survive restart.
 - **Breadcrumb stack for split propogation** - Implemented Petrov's breadcrumb pattern for bottom-up split cascading. Took 3 tries to get child pointer updates right.
 - **Full CRUD operations** - CREATE, INSERT, SELECT, UPDATE, DELETE all working with proper error handling and persistence.
@@ -47,6 +50,12 @@ go test -v ./internal/pager/
 
 # Benchmark B+Tree vs legacy storage
 go test -bench=. ./internal/store/
+
+# Stress test concurrent operations
+./test_concurrent.sh      # 5 clients inserting 1000 records each
+./stress_test.sh          # 150 inserts, 75 deletes with persistence verification
+./test_chaos.sh           # Chaos test: 5 clients with interleaved inserts/deletes
+./test_freelist.sh        # Verify free page reuse after chaos test
 ```
 
 ## Example Usage
@@ -171,6 +180,7 @@ Root: page 1, Type: 0, NextPageID: 2, NumPages: 1, Tree Depth: 1
 | `count` | Count all records | `count` |
 | `count <id>` | Count single record (0 or 1) | `count 5` |
 | `count <start> <end>` | Count records in range | `count 10 100` |
+| `drop <table>` | Drop table and delete file | `drop products` |
 | `stats` | Show tree structure (root, depth, pages) | `stats` |
 | `.help` | Show help | `.help` |
 | `.exit` | Exit the database | `.exit` |
@@ -209,6 +219,9 @@ Tables are stored as `.db` files with page-based B+ tree structure:
     - For each field:
       - Field name (length-prefixed string)
       - Field type (1 byte: 0=int, 1=string, 2=bool, 3=float, 4=date)
+  - FreePageIDs:
+    - Free page count (uint32)
+    - For each free page: PageID (uint32)
 
 [Page 1+: Slotted Pages - 4KB each]
   Header (13 bytes):
@@ -244,7 +257,7 @@ Example hexdump showing header with B+ tree metadata:
 
 - **UPDATE uses DELETE + INSERT**: Not true in-place modification (functional but not optimal)
 - **No borrowing during rebalance**: Merge-only strategy may cause fragmentation in some cases
-- **No free page list**: Orphaned pages after merges are not reclaimed (NextPageID never decreases)
+- **No VACUUM command**: Free page list prevents growth but doesn't reclaim space from file (NextPageID never decreases)
 - **Primary key must be int32**: First field in schema must be int32 type
 - **No transactions**: Operations commit immediately, no rollback support
 - **No buffer pool**: Every page read/write hits disk (future optimization)
@@ -273,10 +286,11 @@ The storage engine uses a fully functional B+ tree with the following characteri
 - **Breadcrumb stack** - Tracks descent path for bottom-up split/merge propagation (pattern from Petrov's "Database Internals")
 - **Sibling pointers** - Leaf nodes linked for efficient range scans (B+ tree characteristic)
 - **Child pointer management** - After inserting promoted key at index i, updates record[i+1] or RightmostChild
-- **Header durability** - Defer pattern syncs BTree header changes (RootPageID, NextPageID) back to DiskManager before write
+- **Header durability** - Defer pattern syncs BTree header changes (RootPageID, NextPageID, FreePageIDs) back to DiskManager before write
 - **Primary key uniqueness** - Search before insert, error on duplicate key (PostgreSQL-style behavior)
 - **Tombstone deletion** - DeleteRecord() marks slot as empty (Offset=0), then Compact() removes gaps
 - **Merge strategy** - Prefer left sibling, merge left-into-right, demote separator key for internal nodes
+- **Free page list** - allocatePage() pops from FreePageIDs before allocating new pages; merge operations append orphaned pages to list
 - **Write-before-recursion** - Critical pattern: write leaf before checking underflow, write parent before checking parent underflow
 - **Root collapse** - When internal root has only RightmostChild, promote it to new root
 
@@ -290,8 +304,7 @@ The storage engine uses a fully functional B+ tree with the following characteri
 - Stress testing: 150 inserts verified multi-level tree growth
 
 **Future Enhancements:**
-- Free page list (track orphaned pages for reuse, prevent file growth)
-- VACUUM command (rebuild tree compactly, reclaim disk space)
+- VACUUM command (rebuild tree compactly, reclaim disk space from file)
 - Node borrowing (currently merge-only, no borrowing from siblings)
 - Buffer pool for page caching (reduce disk I/O)
 - Support non-int primary keys via hashing (currently first field must be int32)
