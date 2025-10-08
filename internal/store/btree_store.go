@@ -137,6 +137,10 @@ func (bts *BTreeStore) RangeScan(startKey, endKey uint64) ([]schema.Record, erro
 	return records, nil
 }
 
+func (bts *BTreeStore) Vacuum() error {
+	return bts.bt.Vacuum()
+}
+
 func (bts *BTreeStore) ScanAll() ([]schema.Record, error) {
 	return bts.RangeScan(0, math.MaxUint64)
 }

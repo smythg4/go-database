@@ -7,6 +7,16 @@ type DiskManager struct {
 	header TableHeader
 }
 
+func NewDiskManager(file *os.File) DiskManager {
+	return DiskManager{
+		file: file,
+	}
+}
+
+func (dm *DiskManager) Close() error {
+	return dm.file.Close()
+}
+
 func (dm *DiskManager) SetFile(file *os.File) {
 	dm.file = file
 }

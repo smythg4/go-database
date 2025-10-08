@@ -365,3 +365,4 @@ The user learns best through guided exploration, not guided implementation.
 - **Free list vs VACUUM**: Free list prevents file growth by reusing pages, but doesn't reclaim disk space. VACUUM needed to rebuild tree compactly and truncate file.
 - **Stress testing importance**: Catastrophic durability bug (100% data loss) only discovered through concurrent stress tests with restart verification.
 - consider adding a JSON/HTTP endpoint
+- make vacuum better than it is

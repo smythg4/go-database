@@ -8,9 +8,10 @@ A from-scratch database implementation in Go, built to answer the question: 'How
 - **Page-Based Disk Format** - 4KB slotted pages with binary serialization
 - **Multi-Client TCP Server** - Concurrent connections on port 42069
 - **Dynamic Schema System** - User-defined tables with custom field types
-- **SQL-like Interface** - CREATE, INSERT, SELECT, UPDATE, DELETE, DESCRIBE, COUNT, DROP with primary key constraints
+- **SQL-like Interface** - CREATE, INSERT, SELECT, UPDATE, DELETE, DESCRIBE, COUNT, DROP, VACUUM with primary key constraints
 - **Node Merging** - Automatic page merging when nodes become underfull after deletion
 - **Free Page List** - Orphaned pages from merges are tracked and reused, preventing file growth
+- **VACUUM** - Rebuild tree from leaf walk to reclaim disk space and fix fragmentation
 - **Range Queries** - Efficient range scans with O(log n + k) complexity via leaf sibling pointers
 - **Type Support** - int32, string, bool, float64, date (ISO 8601)
 - **Primary Key Uniqueness** - Duplicate key detection with PostgreSQL-style errors
@@ -22,6 +23,7 @@ A from-scratch database implementation in Go, built to answer the question: 'How
 - **5,000 concurrent inserts, zero corruption** - Stress tested with 5 concurrent TCP clients hammering the database simultaneously. All data persists correctly.
 - **Chaos testing with concurrent deletes** - 5 clients running interleaved inserts and deletes (2,500 inserts, 1,017 deletes) with zero corruption. Free page list verified working.
 - **Zero file growth from page reuse** - After chaos test, inserting 501 new records consumed 0 new pages (all reused from free list). NextPageID growth: 0.
+- **VACUUM reclaims disk space** - Rebuilt 1,500 record table from 40 pages down to 28 pages (30% reduction) via atomic temp file + rename. Zero data loss.
 - **Caught catastrophic durability bug** - Stress testing revealed 100% data loss on restart. Pages written to OS buffer but never synced to disk. Fixed by adding `Sync()` to `WritePage()`. 5,000 records now survive restart.
 - **Breadcrumb stack for split propogation** - Implemented Petrov's breadcrumb pattern for bottom-up split cascading. Took 3 tries to get child pointer updates right.
 - **Full CRUD operations** - CREATE, INSERT, SELECT, UPDATE, DELETE all working with proper error handling and persistence.
@@ -181,6 +183,7 @@ Root: page 1, Type: 0, NextPageID: 2, NumPages: 1, Tree Depth: 1
 | `count <id>` | Count single record (0 or 1) | `count 5` |
 | `count <start> <end>` | Count records in range | `count 10 100` |
 | `drop <table>` | Drop table and delete file | `drop products` |
+| `vacuum` | Rebuild tree to reclaim disk space | `vacuum` |
 | `stats` | Show tree structure (root, depth, pages) | `stats` |
 | `.help` | Show help | `.help` |
 | `.exit` | Exit the database | `.exit` |
@@ -257,7 +260,7 @@ Example hexdump showing header with B+ tree metadata:
 
 - **UPDATE uses DELETE + INSERT**: Not true in-place modification (functional but not optimal)
 - **No borrowing during rebalance**: Merge-only strategy may cause fragmentation in some cases
-- **No VACUUM command**: Free page list prevents growth but doesn't reclaim space from file (NextPageID never decreases)
+- **VACUUM uses O(n log n) inserts**: Simple implementation works but bulk loading would be 10-100x faster for large tables
 - **Primary key must be int32**: First field in schema must be int32 type
 - **No transactions**: Operations commit immediately, no rollback support
 - **No buffer pool**: Every page read/write hits disk (future optimization)
@@ -278,6 +281,7 @@ The storage engine uses a fully functional B+ tree with the following characteri
 - **Search** - O(log n) point queries with multi-level tree traversal (max depth 100)
 - **Delete** - O(log n) deletion with tombstone pattern, automatic merging when underfull, and bottom-up cascade
 - **RangeScan** - O(log n + k) range queries using sibling pointer chain across leaf nodes with cycle detection
+- **Vacuum** - O(n log n) tree rebuild via leaf walk + inserts to fresh file, atomic rename on completion
 - **Stats** - Debug helper showing root page ID, node type (LEAF/INTERNAL), and NextPageID allocation
 
 **Key Implementation Details:**
@@ -304,7 +308,7 @@ The storage engine uses a fully functional B+ tree with the following characteri
 - Stress testing: 150 inserts verified multi-level tree growth
 
 **Future Enhancements:**
-- VACUUM command (rebuild tree compactly, reclaim disk space from file)
+- Bulk loading for VACUUM (O(n) bottom-up build vs current O(n log n) insert-based approach)
 - Node borrowing (currently merge-only, no borrowing from siblings)
 - Buffer pool for page caching (reduce disk I/O)
 - Support non-int primary keys via hashing (currently first field must be int32)

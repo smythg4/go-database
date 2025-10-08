@@ -131,7 +131,21 @@ func init() {
 			Description: "Delete the underlying table - usage: drop | <tablename>",
 			Callback:    commandDrop,
 		},
+		"vacuum": {
+			Name:        "vacuum",
+			Description: "Systematic compaction and orphan page reaping",
+			Callback:    commandVacuum,
+		},
 	}
+}
+
+func commandVacuum(config *DatabaseConfig, params []string, w io.Writer) error {
+	fmt.Fprintf(w, "Vacuuming up table %s...\n", config.TableS.Schema().TableName)
+	if err := config.TableS.Vacuum(); err != nil {
+		return err
+	}
+	fmt.Fprintf(w, "Vacuum of %s complete\n", config.TableS.Schema().TableName)
+	return nil
 }
 
 func fieldString(typ schema.FieldType) (string, error) {

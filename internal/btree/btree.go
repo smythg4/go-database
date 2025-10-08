@@ -1,9 +1,11 @@
 package btree
 
 import (
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"godb/internal/pager"
+	"os"
 )
 
 type BTree struct {
@@ -662,4 +664,93 @@ func (bt *BTree) Stats() string {
 	depth := bt.GetDepth()
 	return fmt.Sprintf("Root: page %d, Type: %v, NextPageID: %d, NumPages: %d, Tree Depth: %d",
 		bt.Header.RootPageID, root.PageType, bt.Header.NextPageID, bt.Header.NumPages, depth)
+}
+
+func (bt *BTree) Vacuum() error {
+	// update to bulk loading
+
+	tempFile := bt.Header.Schema.TableName + ".db.tmp"
+	f, err := os.Create(tempFile)
+	if err != nil {
+		return err
+	}
+	tempDM := pager.NewDiskManager(f)
+
+	// Create fresh header with same schema but reset page IDs
+	freshHeader := pager.DefaultTableHeader(bt.Header.Schema)
+	tempDM.SetHeader(freshHeader)
+	if err := tempDM.WriteHeader(); err != nil {
+		return err
+	}
+
+	// Create fresh root page
+	rootPage := pager.NewSlottedPage(1, pager.LEAF)
+	if err := tempDM.WriteSlottedPage(rootPage); err != nil {
+		return err
+	}
+
+	newTree := NewBTree(&tempDM, &freshHeader)
+	leafID, err := bt.findLeaf(0, &BTStack{})
+	if err != nil {
+		return err
+	}
+
+	for leafID != 0 {
+		leaf, err := bt.loadNode(leafID)
+		if err != nil {
+			return err
+		}
+		for i := 0; i < int(leaf.NumSlots); i++ {
+			if leaf.Slots[i].Offset == 0 {
+				continue // skip deleted slots
+			}
+			record := leaf.Records[i]
+			if len(record) < 8 {
+				continue // skip malformed records
+			}
+			// Extract key from first 8 bytes
+			key := binary.LittleEndian.Uint64(record[:8])
+			if err := newTree.Insert(key, record); err != nil {
+				// Skip duplicates (caused by stale pointers to freed pages)
+				if err.Error() != fmt.Sprintf("key %d already exists", key) {
+					return err
+				}
+			}
+		}
+		leafID = leaf.NextLeaf
+	}
+
+	// Update header with new tree's state and write it
+	newTree.Header.NumPages = uint32(newTree.Header.NextPageID - 1)
+	newTree.dm.SetHeader(*newTree.Header)
+	err = newTree.dm.WriteHeader()
+	if err != nil {
+		return err
+	}
+	err = f.Sync()
+	if err != nil {
+		return err
+	}
+	err = f.Close()
+	if err != nil {
+		return err
+	}
+
+	if err := bt.dm.Close(); err != nil {
+		return err
+	}
+
+	origFile := bt.Header.Schema.TableName + ".db"
+	os.Rename(tempFile, origFile)
+
+	f, err = os.OpenFile(origFile, os.O_RDWR, 0644)
+	if err != nil {
+		return err
+	}
+	bt.dm.SetFile(f)
+	if err := bt.dm.ReadHeader(); err != nil {
+		return err
+	}
+	bt.Header = bt.dm.GetHeader()
+	return nil
 }
