@@ -243,26 +243,28 @@ func (bt *BTree) Search(key uint64) ([]byte, bool, error) {
 		if err != nil {
 			return nil, false, err
 		}
-		defer bt.pc.UnPin(node.PageID)
 
 		if node.IsLeaf() {
 			// search in the leaf node
 			slotIndex, found := node.Search(key)
 			if !found {
+				bt.pc.UnPin(node.PageID)
 				return nil, false, nil // key not found
 			}
 
 			// get the data record
 			data, err := node.GetRecord(slotIndex)
 			if err != nil {
+				bt.pc.UnPin(node.PageID)
 				return nil, false, err
 			}
-
+			bt.pc.UnPin(node.PageID)
 			return data, true, nil
 		}
 
 		// internal node - find child
 		childPageID, _ := node.SearchInternal(key)
+		bt.pc.UnPin(node.PageID)
 		currentPageID = childPageID
 	}
 	return nil, false, nil // key not found in 100 rounds
@@ -279,7 +281,7 @@ func (bt *BTree) RangeScan(startKey, endKey uint64) ([][]byte, error) {
 		// Check for cycles
 		if visited[leafPageID] {
 			// Build chain for debugging
-			chain := fmt.Sprintf("Cycle: ")
+			chain := "Cycle: "
 			current, _ := bt.findLeaf(startKey, &BTStack{})
 			for i := 0; i < 20 && current != 0; i++ {
 				n, _ := bt.loadNode(current)
@@ -295,7 +297,6 @@ func (bt *BTree) RangeScan(startKey, endKey uint64) ([][]byte, error) {
 		if err != nil {
 			return nil, err
 		}
-		defer bt.pc.UnPin(leaf.PageID)
 
 		for i := 0; i < int(leaf.NumSlots); i++ {
 			key := leaf.GetKey(i)
@@ -308,6 +309,7 @@ func (bt *BTree) RangeScan(startKey, endKey uint64) ([][]byte, error) {
 				break
 			}
 		}
+		bt.pc.UnPin(leaf.PageID)
 		leafPageID = leaf.NextLeaf
 	}
 	return results, nil
@@ -721,7 +723,7 @@ func (bt *BTree) Vacuum() error {
 		if err != nil {
 			return err
 		}
-		defer bt.pc.UnPin(leaf.PageID)
+
 		for i := 0; i < int(leaf.NumSlots); i++ {
 			record := leaf.Records[i]
 			if len(record) < 8 {
@@ -732,21 +734,17 @@ func (bt *BTree) Vacuum() error {
 			if err := newTree.Insert(key, record); err != nil {
 				// Skip duplicates (caused by stale pointers to freed pages)
 				if err.Error() != fmt.Sprintf("key %d already exists", key) {
+					bt.pc.UnPin(leaf.PageID)
 					return err
 				}
 			}
 		}
+		bt.pc.UnPin(leaf.PageID)
 		leafID = leaf.NextLeaf
 	}
 
-	// Flush new tree header and close the file
-	if err := newTree.pc.FlushHeader(); err != nil {
-		return err
-	}
-	if err := f.Sync(); err != nil {
-		return err
-	}
-	if err := f.Close(); err != nil {
+	// Flush new tree (pages + header) and close the file
+	if err := newTree.pc.Close(); err != nil {
 		return err
 	}
 

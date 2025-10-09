@@ -39,7 +39,7 @@ func (pc *PageCache) backgroundFlusher(pagesToWrite <-chan PageID) error {
 	return nil
 }
 
-const maxCacheSize = 500
+const maxCacheSize = 50
 
 type CacheRecord struct {
 	id       PageID

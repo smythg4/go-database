@@ -144,7 +144,22 @@ func commandVacuum(config *DatabaseConfig, params []string, w io.Writer) error {
 	if err := config.TableS.Vacuum(); err != nil {
 		return err
 	}
-	fmt.Fprintf(w, "Vacuum of %s complete\n", config.TableS.Schema().TableName)
+	tableName := config.TableS.Schema().TableName
+	fName := tableName + ".db"
+
+	// Clear cache and reload fresh instance
+	tableCacheMu.Lock()
+	delete(tableCache, fName)
+	tableCacheMu.Unlock()
+
+	// Reload the table fresh from disk
+	freshTable, err := GetOrOpenTable(fName)
+	if err != nil {
+		return fmt.Errorf("failed to reload after vacuum: %v", err)
+	}
+	config.TableS = freshTable
+
+	fmt.Fprintf(w, "Vacuum complete.\n")
 	return nil
 }
 
@@ -177,6 +192,11 @@ func commandDrop(config *DatabaseConfig, params []string, w io.Writer) error {
 	if err != nil && !os.IsNotExist(err) {
 		return err
 	}
+
+	tableCacheMu.Lock()
+	delete(tableCache, fName)
+	tableCacheMu.Unlock()
+
 	fmt.Fprintf(w, "Dropped table %s\n", tName)
 	return nil
 }

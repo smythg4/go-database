@@ -342,3 +342,162 @@ func TestRootPageIDGetSet(t *testing.T) {
 
 	_ = initialRoot // silence unused warning
 }
+
+// Test that simulates defer-in-loop bug (pages stay pinned)
+func TestDeferInLoopBug(t *testing.T) {
+	pc, _, filename := createTestPageCache(t)
+	defer cleanupTestFile(filename)
+
+	// Simulate the buggy pattern: defer inside loop
+	simulateBuggyRangeScan := func(count int) {
+		var deferred []func()
+		for i := 1; i <= count; i++ {
+			pageID := PageID(i)
+			pc.Fetch(pageID) // Fetch auto-pins
+			// Simulate defer - doesn't execute until function end
+			capturedID := pageID
+			deferred = append(deferred, func() { pc.UnPin(capturedID) })
+		}
+
+		// At this point, ALL pages are still pinned
+		pinnedCount := 0
+		pc.mu.Lock()
+		for _, cr := range pc.cache {
+			if cr.pinCount > 0 {
+				pinnedCount++
+			}
+		}
+		pc.mu.Unlock()
+
+		if pinnedCount != count {
+			t.Errorf("Expected %d pinned pages, got %d", count, pinnedCount)
+		}
+
+		// Execute deferred unpins (happens at function end)
+		for _, fn := range deferred {
+			fn()
+		}
+	}
+
+	// Run with 30 pages - all should stay pinned until function end
+	simulateBuggyRangeScan(30)
+
+	// After function returns, all should be unpinned
+	pinnedCount := 0
+	pc.mu.Lock()
+	for _, cr := range pc.cache {
+		if cr.pinCount > 0 {
+			pinnedCount++
+		}
+	}
+	pc.mu.Unlock()
+
+	if pinnedCount != 0 {
+		t.Errorf("Expected 0 pinned pages after function returns, got %d", pinnedCount)
+	}
+}
+
+// Test cache eviction failure when all pages pinned
+func TestAllPagesPinnedEvictionFails(t *testing.T) {
+	pc, _, filename := createTestPageCache(t)
+	defer cleanupTestFile(filename)
+
+	// Fill cache and keep all pages pinned (test setup only has 60 pages on disk)
+	available := 60
+	for i := 1; i <= available; i++ {
+		pc.Fetch(PageID(i))
+		// Don't unpin - simulate defer-in-loop accumulation
+	}
+
+	// Cache should have all available pages
+	if len(pc.cache) != available {
+		t.Fatalf("Expected cache size %d, got %d", available, len(pc.cache))
+	}
+
+	// All pages should be pinned
+	pinnedCount := 0
+	pc.mu.Lock()
+	for _, cr := range pc.cache {
+		if cr.pinCount > 0 {
+			pinnedCount++
+		}
+	}
+	pc.mu.Unlock()
+
+	if pinnedCount != available {
+		t.Fatalf("Expected %d pinned pages, got %d", available, pinnedCount)
+	}
+
+	// Try to allocate a NEW page (not on disk) - cache must make room
+	// Since all pages are pinned, eviction should fail
+	pageID := pc.AllocatePage()
+	sp := NewSlottedPage(pageID, LEAF)
+	err := pc.AddNewPage(sp)
+
+	// If cache is full of pinned pages, this should fail
+	// (but only if cache < 60, otherwise there's room)
+	if len(pc.cache) >= maxCacheSize {
+		if err == nil {
+			t.Error("Expected error when cache full and all pinned, got nil")
+		}
+		if err.Error() != "all pages pinned" && err.Error() != "unable to evict cache to make room" {
+			t.Errorf("Unexpected error: %v", err)
+		}
+	} else {
+		t.Logf("Cache not full (%d < %d), AddNewPage succeeded", len(pc.cache), maxCacheSize)
+	}
+}
+
+// Test correct pattern: unpin immediately in loop
+func TestCorrectUnpinInLoop(t *testing.T) {
+	pc, _, filename := createTestPageCache(t)
+	defer cleanupTestFile(filename)
+
+	// Simulate correct pattern: unpin immediately
+	simulateCorrectRangeScan := func(count int) {
+		for i := 1; i <= count; i++ {
+			pageID := PageID(i)
+			pc.Fetch(pageID) // Auto-pins
+			// Immediately unpin (not deferred)
+			pc.UnPin(pageID)
+		}
+
+		// At this point, all pages should be unpinned
+		pinnedCount := 0
+		pc.mu.Lock()
+		for _, cr := range pc.cache {
+			if cr.pinCount > 0 {
+				pinnedCount++
+			}
+		}
+		pc.mu.Unlock()
+
+		if pinnedCount != 0 {
+			t.Errorf("Expected 0 pinned pages, got %d", pinnedCount)
+		}
+	}
+
+	simulateCorrectRangeScan(30)
+}
+
+// Test bulk operations don't exhaust cache
+func TestBulkFetchesWithImmediateUnpin(t *testing.T) {
+	pc, _, filename := createTestPageCache(t)
+	defer cleanupTestFile(filename)
+
+	// Fetch more pages than cache capacity, but unpin immediately
+	iterations := maxCacheSize * 3
+	for i := 1; i <= iterations; i++ {
+		pageID := PageID((i % 60) + 1) // Cycle through 60 pages
+		_, err := pc.Fetch(pageID)
+		if err != nil {
+			t.Fatalf("Fetch failed at iteration %d: %v", i, err)
+		}
+		pc.UnPin(pageID)
+
+		// Cache should never exceed maxCacheSize
+		if len(pc.cache) > maxCacheSize {
+			t.Errorf("Cache exceeded max size: %d > %d", len(pc.cache), maxCacheSize)
+		}
+	}
+}
