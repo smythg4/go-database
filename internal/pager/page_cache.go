@@ -106,6 +106,19 @@ func (pc *PageCache) AddNewPage(sp *SlottedPage) error {
 }
 
 func (pc *PageCache) FreePage(id PageID) {
+	pc.mu.Lock()
+	defer pc.mu.Unlock()
+
+	// remove the page from the cache -- forcefully
+	delete(pc.cache, id)
+
+	// remove from the fifoQueue if present
+	for i, qid := range pc.fifoQueue {
+		if qid == id {
+			pc.fifoQueue = append(pc.fifoQueue[:i], pc.fifoQueue[i+1:]...)
+			// keep it going just in case there's duplicates
+		}
+	}
 	pc.header.FreePageIDs = append(pc.header.FreePageIDs, id)
 }
 
@@ -151,6 +164,7 @@ func (pc *PageCache) CachePage(sp *SlottedPage) error {
 
 	// if cache is full, initiate an eviction
 	if len(pc.cache) >= maxCacheSize {
+		fmt.Printf("DEBUG: Cache FULL (%d pages), evicting to make room for page %d\n", len(pc.cache), sp.PageID)
 		if err := pc.Evict(); err != nil {
 			return err
 		}
@@ -176,6 +190,7 @@ func (pc *PageCache) MakeDirty(id PageID) error {
 }
 
 func (pc *PageCache) Evict() error {
+	pinnedSkips := 0
 	for len(pc.fifoQueue) > 0 {
 		id := pc.fifoQueue[0]
 		cr, exists := pc.cache[id]
@@ -190,6 +205,7 @@ func (pc *PageCache) Evict() error {
 			// pinned, skip for now
 			pc.fifoQueue = pc.fifoQueue[1:]
 			pc.fifoQueue = append(pc.fifoQueue, cr.id)
+			pinnedSkips++
 			continue
 		}
 
@@ -197,12 +213,16 @@ func (pc *PageCache) Evict() error {
 			if err := pc.flushRecord(cr); err != nil {
 				return err
 			}
+			fmt.Printf("DEBUG: Evicted dirty page %d (pinned skips: %d, cache size: %d)\n", id, pinnedSkips, len(pc.cache))
+		} else {
+			fmt.Printf("DEBUG: Evicted clean page %d (pinned skips: %d, cache size: %d)\n", id, pinnedSkips, len(pc.cache))
 		}
 
 		pc.fifoQueue = pc.fifoQueue[1:]
 		delete(pc.cache, id)
 		return nil
 	}
+	fmt.Printf("DEBUG: Evict FAILED - all %d pages pinned\n", len(pc.cache))
 	return errors.New("all pages pinned")
 }
 

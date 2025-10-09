@@ -278,7 +278,16 @@ func (bt *BTree) RangeScan(startKey, endKey uint64) ([][]byte, error) {
 	for leafPageID != 0 { // 0 = end of the line
 		// Check for cycles
 		if visited[leafPageID] {
-			return nil, fmt.Errorf("cycle detected in leaf chain at page %d", leafPageID)
+			// Build chain for debugging
+			chain := fmt.Sprintf("Cycle: ")
+			current, _ := bt.findLeaf(startKey, &BTStack{})
+			for i := 0; i < 20 && current != 0; i++ {
+				n, _ := bt.loadNode(current)
+				chain += fmt.Sprintf("%d->", current)
+				current = n.NextLeaf
+				bt.pc.UnPin(n.PageID)
+			}
+			return nil, fmt.Errorf("cycle detected in leaf chain at page %d. Chain: %s", leafPageID, chain)
 		}
 		visited[leafPageID] = true
 
@@ -288,11 +297,7 @@ func (bt *BTree) RangeScan(startKey, endKey uint64) ([][]byte, error) {
 		}
 		defer bt.pc.UnPin(leaf.PageID)
 
-		for i := 0; i < len(leaf.Records); i++ {
-			// skip tombstones
-			if leaf.Records[i] == nil {
-				continue
-			}
+		for i := 0; i < int(leaf.NumSlots); i++ {
 			key := leaf.GetKey(i)
 			if key >= startKey && key <= endKey {
 				data, _ := leaf.GetRecord(i)
@@ -322,23 +327,13 @@ func (bt *BTree) findLeftSibling(parent *BNode, childIndex int) (pager.PageID, i
 	if childIndex == -1 {
 		// we're rightmostchild, left sibling is last non-tombstone record
 		separatorIndex = int(parent.NumSlots) - 1
-		// scan backwards to find first non-tombstone
-		for separatorIndex >= 0 && parent.Records[separatorIndex] == nil {
-			separatorIndex--
-		}
 		if separatorIndex < 0 {
-			return 0, -1, false // no non-tombstone records
+			return 0, -1, false // no records
 		}
 		_, siblingID = pager.DeserializeInternalRecord(parent.Records[separatorIndex])
 	} else {
 		// normal case: left sibling is at childIndex-1
 		separatorIndex = childIndex - 1
-		for separatorIndex >= 0 && parent.Records[separatorIndex] == nil {
-			separatorIndex--
-		}
-		if separatorIndex < 0 {
-			return 0, -1, false // no left sibling (all tombstones)
-		}
 		_, siblingID = pager.DeserializeInternalRecord(parent.Records[separatorIndex])
 	}
 
@@ -356,18 +351,12 @@ func (bt *BTree) findRightSibling(parent *BNode, childIndex int) (pager.PageID, 
 	var siblingID pager.PageID
 	separatorIndex := childIndex
 
-	// scan forward to find the first non-tombstone after childIndex
-	nextIndex := childIndex + 1
-	for nextIndex < len(parent.Records) && parent.Records[nextIndex] == nil {
-		nextIndex++
-	}
-
-	if nextIndex >= len(parent.Records) {
-		// no non-tombstone records after childIndex, right sibling is rightmostChild
+	if childIndex+1 >= int(parent.NumSlots) {
+		// no records after childIndex, right sibling is rightmostChild
 		siblingID = parent.RightmostChild
 	} else {
-		// found a non-tombstone record
-		_, siblingID = pager.DeserializeInternalRecord(parent.Records[nextIndex])
+		// right sibling is at childIndex+1
+		_, siblingID = pager.DeserializeInternalRecord(parent.Records[childIndex+1])
 	}
 	return siblingID, separatorIndex, true
 }
@@ -409,24 +398,18 @@ func (bt *BTree) mergeInternalNodes(sibling, underflowNode, parent *BNode, separ
 		return err
 	}
 
-	orphanedPageID := rightNode.PageID
-	bt.pc.FreePage(orphanedPageID)
+	bt.pc.FreePage(rightNode.PageID)
+
 	// remove separator from parent
 	if err := parent.DeleteRecord(separatorIndex); err != nil {
 		return err
 	}
 
-	// update parent pointer - with tombstone model, records don't shift
-	// need to find next non-tombstone record after separatorIndex
-	nextIndex := separatorIndex + 1
-	for nextIndex < len(parent.Records) && parent.Records[nextIndex] == nil {
-		nextIndex++
-	}
-
-	if nextIndex < len(parent.Records) && parent.Records[nextIndex] != nil {
-		// update the next record's pointer to point to merged node
-		oldKey, _ := pager.DeserializeInternalRecord(parent.Records[nextIndex])
-		parent.Records[nextIndex] = pager.SerializeInternalRecord(oldKey, leftNode.PageID)
+	// after compact, records shift - separatorIndex now points to what was the next record
+	if separatorIndex < int(parent.NumSlots) {
+		// update this record's pointer to point to merged node
+		oldKey, _ := pager.DeserializeInternalRecord(parent.Records[separatorIndex])
+		parent.Records[separatorIndex] = pager.SerializeInternalRecord(oldKey, leftNode.PageID)
 	} else {
 		// no more records, update rightmostchild
 		parent.RightmostChild = leftNode.PageID
@@ -441,52 +424,41 @@ func (bt *BTree) mergeLeafNodes(sibling, underflowNode, parent *BNode, separator
 		return errors.New("both siblings must be LEAF, parent must be INTERNAL")
 	}
 
-	var mergedNode *BNode
-	var err error
+	var leftNode, rightNode *BNode
 	if mergeIntoSibling {
-		// this means we found a left sibling, merge into that
-		err = sibling.MergeLeaf(underflowNode.SlottedPage)
-		mergedNode = sibling
+		// Found left sibling - merge right into left
+		leftNode = sibling
+		rightNode = underflowNode
 	} else {
-		// this means we found a right sibling, merge us into it
-		err = underflowNode.MergeLeaf(sibling.SlottedPage)
-		mergedNode = underflowNode
+		// Found right sibling - merge right into left
+		leftNode = underflowNode
+		rightNode = sibling
 	}
-	if err != nil {
+
+	// always merge right into left
+	if err := leftNode.MergeLeaf(rightNode.SlottedPage); err != nil {
 		return err
 	}
 
-	// write mergedNode
-	if err := bt.writeNode(mergedNode); err != nil {
+	// write merged (left) node
+	if err := bt.writeNode(leftNode); err != nil {
 		return err
 	}
 
-	var orphanedPageID pager.PageID
-	if mergeIntoSibling {
-		orphanedPageID = underflowNode.PageID
-	} else {
-		orphanedPageID = sibling.PageID
-	}
-	bt.pc.FreePage(orphanedPageID)
+	// right node is always orphaned
+	bt.pc.FreePage(rightNode.PageID)
+
 	// remove separator from parent
 	if err := parent.DeleteRecord(separatorIndex); err != nil {
 		return err
 	}
 
-	// update parent pointer - with tombstone model, records don't shift
-	// need to find next non-tombstone record after separatorIndex
-	nextIndex := separatorIndex + 1
-	for nextIndex < len(parent.Records) && parent.Records[nextIndex] == nil {
-		nextIndex++
-	}
-
-	if nextIndex < len(parent.Records) && parent.Records[nextIndex] != nil {
-		// update the next record's pointer to point to merged node
-		oldKey, _ := pager.DeserializeInternalRecord(parent.Records[nextIndex])
-		parent.Records[nextIndex] = pager.SerializeInternalRecord(oldKey, mergedNode.PageID)
+	// update parent pointer to point to left (survivor)
+	if separatorIndex < int(parent.NumSlots) {
+		oldKey, _ := pager.DeserializeInternalRecord(parent.Records[separatorIndex])
+		parent.Records[separatorIndex] = pager.SerializeInternalRecord(oldKey, leftNode.PageID)
 	} else {
-		// no more records, update rightmostchild
-		parent.RightmostChild = mergedNode.PageID
+		parent.RightmostChild = leftNode.PageID
 	}
 
 	return nil
@@ -751,9 +723,6 @@ func (bt *BTree) Vacuum() error {
 		}
 		defer bt.pc.UnPin(leaf.PageID)
 		for i := 0; i < int(leaf.NumSlots); i++ {
-			if leaf.Slots[i].Offset == 0 {
-				continue // skip deleted slots
-			}
 			record := leaf.Records[i]
 			if len(record) < 8 {
 				continue // skip malformed records

@@ -174,7 +174,7 @@ func (sp *SlottedPage) InsertRecord(data []byte) (int, error) {
 }
 
 func (sp *SlottedPage) GetRecord(slotIndex int) ([]byte, error) {
-	if slotIndex >= len(sp.Records) {
+	if slotIndex >= int(sp.NumSlots) {
 		return nil, errors.New("slot out of range")
 	}
 	if sp.Slots[slotIndex].Offset == 0 {
@@ -185,8 +185,7 @@ func (sp *SlottedPage) GetRecord(slotIndex int) ([]byte, error) {
 }
 
 func (sp *SlottedPage) DeleteRecord(slotIndex int) error {
-	// tombstone markers
-	if slotIndex >= len(sp.Records) {
+	if slotIndex >= int(sp.NumSlots) {
 		return errors.New("slot out of range")
 	}
 	if sp.Records[slotIndex] == nil {
@@ -198,11 +197,12 @@ func (sp *SlottedPage) DeleteRecord(slotIndex int) error {
 	sp.Records[slotIndex] = nil
 	sp.NumSlots--
 
-	return nil
+	// this compact call is inefficient, but tombstone tracking was f**king me up!
+	return sp.Compact()
 }
 
 func (sp *SlottedPage) GetKey(slotIndex int) uint64 {
-	if slotIndex >= len(sp.Records) || sp.Records[slotIndex] == nil {
+	if slotIndex >= int(sp.NumSlots) {
 		return 0
 	}
 	// first 8 bytes of record is the key
@@ -210,36 +210,25 @@ func (sp *SlottedPage) GetKey(slotIndex int) uint64 {
 }
 
 func (sp *SlottedPage) findInsertionPosition(key uint64) int {
-	left, right := 0, len(sp.Records)
+	left, right := 0, int(sp.NumSlots)
 	for left < right {
 		mid := (left + right) / 2
-		if sp.Records[mid] == nil {
-			// tombstone - move right
-			left = mid + 1
-			continue
-		}
+
 		if sp.GetKey(mid) < key {
 			left = mid + 1
 		} else {
 			right = mid
 		}
 	}
-	// skip any tombstones starting at left position
-	for left < len(sp.Records) && sp.Records[left] == nil {
-		left++
-	}
+
 	return left
 }
 
 func (sp *SlottedPage) SearchInternal(key uint64) (PageID, int) {
-	left, right := 0, len(sp.Records)
+	left, right := 0, int(sp.NumSlots)
 	for left < right {
 		mid := (left + right) / 2
-		if sp.Records[mid] == nil {
-			// tombstone - move right
-			left = mid + 1
-			continue
-		}
+
 		midKey := sp.GetKey(mid)
 		if midKey < key {
 			left = mid + 1
@@ -248,12 +237,7 @@ func (sp *SlottedPage) SearchInternal(key uint64) (PageID, int) {
 		}
 	}
 
-	// skip any tombstones starting at left position
-	for left < len(sp.Records) && sp.Records[left] == nil {
-		left++
-	}
-
-	if left >= len(sp.Records) {
+	if left >= int(sp.NumSlots) {
 		return sp.RightmostChild, -1
 	}
 
@@ -261,34 +245,17 @@ func (sp *SlottedPage) SearchInternal(key uint64) (PageID, int) {
 	return childPageID, left
 }
 
-// old binary search method - was struggling with tombstones
-// func (sp *SlottedPage) Search(key uint64) (int, bool) {
-// 	left, right := 0, len(sp.Records)
-// 	for left < right {
-// 		mid := (left + right) / 2
-// 		midKey := sp.GetKey(mid)
-// 		if midKey == key {
-// 			return mid, true
-// 		} else if midKey < key {
-// 			left = mid + 1
-// 		} else {
-// 			right = mid
-// 		}
-// 	}
-// 	return -1, false
-// }
-
 func (sp *SlottedPage) Search(key uint64) (int, bool) {
-	for i := 0; i < len(sp.Records); i++ {
-		if sp.Records[i] == nil {
-			continue // skip tombstones
-		}
-		recordKey := sp.GetKey(i)
-		if recordKey == key {
-			return i, true
-		}
-		if recordKey > key {
-			break // records are sorted, no need to continue
+	left, right := 0, int(sp.NumSlots)
+	for left < right {
+		mid := (left + right) / 2
+		midKey := sp.GetKey(mid)
+		if midKey == key {
+			return mid, true
+		} else if midKey < key {
+			left = mid + 1
+		} else {
+			right = mid
 		}
 	}
 	return -1, false
@@ -420,22 +387,15 @@ func (sp *SlottedPage) MergeLeaf(sibling *SlottedPage) error {
 		return errors.New("both pages must be leaf pages")
 	}
 
-	// compact to remove tombstones first (maybe inefficient, but works for now)
-	if err := sp.Compact(); err != nil {
-		return err
-	}
-
 	if !sp.CanMergeWith(sibling) {
 		return errors.New("pages too large to merge")
 	}
 
 	// copy all records from sibling to this page
-	for i := 0; i < len(sibling.Records); i++ {
-		if sibling.Slots[i].Offset > 0 && sibling.Slots[i].Length > 0 {
-			_, err := sp.InsertRecordSorted(sibling.Records[i])
-			if err != nil {
-				return err
-			}
+	for i := 0; i < int(sibling.NumSlots); i++ {
+		_, err := sp.InsertRecordSorted(sibling.Records[i])
+		if err != nil {
+			return err
 		}
 	}
 
@@ -450,22 +410,15 @@ func (sp *SlottedPage) MergeInternals(sibling *SlottedPage) error {
 		return errors.New("all pages must be INTERNAL")
 	}
 
-	// compact to remove tombstones first (maybe inefficient, but works for now)
-	if err := sp.Compact(); err != nil {
-		return err
-	}
-
 	if !sp.CanMergeWith(sibling) {
 		return errors.New("pages too large to merge")
 	}
 
 	// copy all records from sibling to this page
-	for i := 0; i < len(sibling.Records); i++ {
-		if sibling.Slots[i].Offset > 0 && sibling.Slots[i].Length > 0 {
-			_, err := sp.InsertRecordSorted(sibling.Records[i])
-			if err != nil {
-				return err
-			}
+	for i := 0; i < int(sibling.NumSlots); i++ {
+		_, err := sp.InsertRecordSorted(sibling.Records[i])
+		if err != nil {
+			return err
 		}
 	}
 	// update the rightmost child to reflect the sibling's rightmostchild
