@@ -3,6 +3,7 @@ package schema
 import (
 	"bytes"
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"godb/internal/encoding"
 	"io"
@@ -266,4 +267,20 @@ func readFieldValue(r io.Reader, fieldType FieldType) (any, error) {
 	default:
 		return nil, fmt.Errorf("unsupported type: %v", fieldType)
 	}
+}
+
+func (s *Schema) ExtractPrimaryKey(record Record) (uint64, error) {
+	if len(s.Fields) == 0 {
+		return 0, errors.New("schema has no fields")
+	}
+
+	firstField := s.Fields[0]
+	id, ok := record[firstField.Name].(int32)
+	if !ok {
+		return 0, fmt.Errorf("primary key %s must be int32", firstField.Name)
+	}
+	if id < 0 {
+		return 0, fmt.Errorf("primary key cannot be negative: %d", id)
+	}
+	return uint64(id), nil
 }

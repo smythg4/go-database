@@ -3,6 +3,8 @@ package pager
 import (
 	"errors"
 	"fmt"
+	"godb/internal/schema"
+	"os"
 	"sync"
 	"time"
 )
@@ -37,7 +39,7 @@ func (pc *PageCache) backgroundFlusher(pagesToWrite <-chan PageID) error {
 	return nil
 }
 
-const maxCacheSize = 50
+const maxCacheSize = 500
 
 type CacheRecord struct {
 	id       PageID
@@ -95,7 +97,12 @@ func (pc *PageCache) AddNewPage(sp *SlottedPage) error {
 	if err := pc.CachePage(sp); err != nil {
 		return err
 	}
-	return pc.MakeDirty(sp.PageID)
+
+	// mark new page dirty and pin it
+	pc.cache[sp.PageID].isDirty = true
+	pc.cache[sp.PageID].pinCount++
+
+	return nil
 }
 
 func (pc *PageCache) FreePage(id PageID) {
@@ -247,6 +254,10 @@ func (pc *PageCache) flushAll() error {
 	if err := pc.dm.Sync(); err != nil {
 		return err
 	}
+	// also flush the header to disk
+	if err := pc.FlushHeader(); err != nil {
+		return err
+	}
 	for _, cr := range pc.cache {
 		cr.isDirty = false
 	}
@@ -276,6 +287,46 @@ func (pc *PageCache) GetHeader() *TableHeader {
 }
 
 func (pc *PageCache) FlushHeader() error {
+	pc.header.NumPages = uint32(pc.header.NextPageID - 1)
 	pc.dm.SetHeader(*pc.header)
 	return pc.dm.WriteHeader()
+}
+
+func (pc *PageCache) GetSchema() schema.Schema {
+	return pc.header.Schema
+}
+
+func (pc *PageCache) Close() error {
+	// flush everything to the disk first
+	if err := pc.flushAll(); err != nil {
+		return err
+	}
+	return pc.dm.Close()
+}
+
+func (pc *PageCache) UpdateFile(file *os.File) error {
+	// switch to new file (after vacuum rename)
+	pc.dm.SetFile(file)
+	if err := pc.dm.ReadHeader(); err != nil {
+		return err
+	}
+
+	// update header pointer
+	newHeader := pc.dm.GetHeader()
+	pc.header = newHeader
+
+	// clear cache (pages are from old file)
+	pc.mu.Lock()
+	defer pc.mu.Unlock()
+	pc.cache = make(map[PageID]*CacheRecord, maxCacheSize)
+	pc.fifoQueue = []PageID{}
+	return nil
+}
+
+func (pc *PageCache) Contains(id PageID) bool {
+	pc.mu.Lock()
+	defer pc.mu.Unlock()
+
+	_, exists := pc.cache[id]
+	return exists
 }

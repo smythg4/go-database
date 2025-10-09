@@ -67,6 +67,27 @@ A handrolled database implementation in Go with multi-client TCP server support,
 
 ### B+ Tree Storage Engine (`internal/pager` + `internal/btree`)
 
+**Page Cache Layer (`internal/pager/page_cache.go`)** - Buffer pool for page caching:
+- `PageCache`: In-memory cache with FIFO eviction policy (maxCacheSize = 50 pages)
+- `CacheRecord`: Tracks page data, dirty flag, and pin count for each cached page
+- Pin/unpin semantics prevent eviction of in-use pages during tree operations
+- Key methods:
+  - `Fetch(id)`: Returns page from cache or loads from disk, auto-pins on fetch
+  - `AddNewPage(sp)`: Adds new page to cache, marks dirty, and pins it
+  - `UnPin(id)`: Decrements pin count, allowing eviction when count reaches 0
+  - `Evict()`: FIFO eviction of unpinned pages, flushes dirty pages before eviction
+  - `MakeDirty(id)`: Marks cached page as dirty (needs flush on eviction)
+  - `AllocatePage()`: Allocates new PageID, checks FreePageIDs first
+  - `FreePage(id)`: Adds PageID to free list for reuse
+  - `FlushHeader()`: Writes table header to disk, auto-calculates NumPages
+  - `Close()`: Flushes all dirty pages and closes underlying file
+  - `UpdateFile(file)`: Switches to new file after VACUUM rename, clears cache
+- **Critical pattern**: BTree operations must pin pages during use, unpin via defer when done
+- **Eviction strategy**: Pages skipped if pinned, moved to back of FIFO queue if pinned
+- **Header management**: PageCache owns header pointer, BTree accesses via Get/Set methods
+- **Concurrency**: PageCache.mu protects cache map and queue, BTreeStore.mu serializes BTree access
+- **Current status**: Implementation in progress, debugging cache flush behavior
+
 **Page Layer (`internal/pager/page.go`)** - Slotted page implementation:
 - `SlottedPage`: In-memory representation with 13-byte header, slot array, and records
   - Header: PageType (LEAF/INTERNAL), NumSlots, FreeSpacePtr, RightmostChild, NextLeaf
@@ -75,19 +96,21 @@ A handrolled database implementation in Go with multi-client TCP server support,
   - 4KB fixed page size (PAGE_SIZE = 4096)
 - Key methods:
   - `InsertRecordSorted`: Binary search insertion maintaining key order
-  - `DeleteRecord`: Tombstone approach (mark Offset=0) then immediate Compact
-  - `Search`: Binary search for exact key match in leaf nodes
-  - `SearchInternal`: Routes search to correct child page in internal nodes
+  - `DeleteRecord`: Tombstone approach (mark Offset=0, Length=0, Records[i]=nil)
+  - `Search`: Binary search for exact key match in leaf nodes, skips tombstones
+  - `SearchInternal`: Routes search to correct child page in internal nodes, skips tombstones
   - `SplitLeaf/SplitInternal`: Node splitting with promoted key handling and child pointer updates
-  - `MergeLeaf/MergeInternals`: Combine two nodes (updates NextLeaf chain for leaves)
+  - `MergeLeaf/MergeInternals`: Combine two nodes (updates NextLeaf chain for leaves), calls Compact first
   - `CanMergeWith`: Check if two pages fit together (combined size + slot overhead ≤ PAGE_SIZE)
   - `IsUnderfull`: Returns true if GetUsedSpace() < PAGE_SIZE/2
-  - `Compact`: Removes deleted record gaps by repacking active records
+  - `GetUsedSpace()`: Calculates space used by active records only (skips tombstones where Offset=0)
+  - `Compact`: Removes tombstone gaps by repacking active records, called before merges
   - `Serialize/Deserialize`: Convert between in-memory (13-byte header) and disk ([4096]byte array)
 - Record formats:
   - Leaf: [key: 8 bytes][full record data: variable]
   - Internal: [key: 8 bytes][child PageID: 4 bytes]
 - First field in schema is always the key
+- **Tombstone model**: DeleteRecord doesn't compact immediately, allows tombstones to accumulate, Compact called only before merges
 
 **Table Metadata (`internal/pager/header.go`)**:
 - `TableHeader`: Magic ("GDBT"), version, RootPageID, NextPageID, NumPages, Schema, FreePageIDs
@@ -106,37 +129,48 @@ A handrolled database implementation in Go with multi-client TCP server support,
 - **WritePage now calls Sync()**: Each page write is immediately flushed (performance cost, but ensures durability)
 
 **B-Tree Orchestration (`internal/btree/btree.go`)**:
-- `BTree`: Manages tree structure via DiskManager and TableHeader
+- `BTree`: Manages tree structure via PageCache (which wraps DiskManager)
 - `BNode`: Thin wrapper around SlottedPage for tree-specific operations
-- `NewBTree(dm, header)`: Constructor for creating BTree with unexported fields
+- `NewBTree(dm, header)`: Constructor creates PageCache, returns BTree with pc field
+- **Integration with PageCache**:
+  - `loadNode(id)`: Calls `pc.Fetch(id)`, wraps in BNode (auto-pins page)
+  - `writeNode(node)`: Checks if page cached via `pc.Contains()`, adds via `AddNewPage()` if not, then calls `MakeDirty()`
+  - All loadNode calls followed by `defer bt.pc.UnPin(node.PageID)` to allow eviction
+  - New pages from splits immediately pinned via AddNewPage, unpinned at end of operation
 - **Free Page Management**:
-  - `allocatePage()`: Checks FreePageIDs slice, pops if available, otherwise increments NextPageID
-  - Merge operations append orphaned PageID to FreePageIDs slice
+  - `allocatePage()`: Calls `pc.AllocatePage()` which checks FreePageIDs first
+  - Merge operations call `pc.FreePage(orphanedPageID)` to add to free list
   - **No mutex protection**: BTreeStore's RWMutex serializes all BTree access, so FreePageIDs is implicitly protected
 - Key algorithms:
   - `Insert`: Uses breadcrumb stack to track descent path, handles splits bottom-up
-    - **Critical**: Defer pattern syncs header and calls Sync(): `defer func() { bt.dm.SetHeader(*bt.Header); bt.dm.WriteHeader(); bt.dm.Sync() }()`
+    - **Critical**: Defer pattern flushes header at end: `defer bt.pc.FlushHeader()`
+    - Pins pages during descent, unpins via defer when done
   - `Delete`: Traverses to leaf, deletes record, writes leaf BEFORE checking underflow, handles merges
-    - **Critical**: Same defer pattern as Insert for header sync
+    - **Critical**: Same defer pattern as Insert for header flush
     - Writes modified leaf before underflow check to ensure durability
+    - Pins pages during descent, unpins via defer when done
   - `propagateSplit`: Inserts promoted keys into parents, cascades splits up tree
   - `handleRootSplit`: Creates new internal root when root overflows (tree height growth)
   - `handleUnderflow`: Detects underflow, finds sibling, attempts merge, recurses on parent underflow
     - **Critical**: Writes parent BEFORE checking parent underflow (prevents stale parent pointers)
   - `handleRootUnderflow`: Collapses root when internal root has NumSlots=0 (only RightmostChild remains)
-  - `mergeLeafNodes/mergeInternalNodes`: Combines siblings, updates parent pointers
+  - `mergeLeafNodes/mergeInternalNodes`: Combines siblings, updates parent pointers with tombstone awareness
     - Internal merge demotes separator key: `SerializeInternalRecord(separatorKey, leftNode.RightmostChild)`
+    - **Tombstone handling**: After DeleteRecord, finds next non-tombstone record to update pointer (records don't shift)
   - `findLeftSibling/findRightSibling`: Navigates parent to locate merge partners
   - `Search`: Descends tree using SearchInternal/Search, max depth check prevents infinite loops
   - `RangeScan`: Follows NextLeaf sibling chain with cycle detection
   - `Stats()`: Debug helper showing root page ID, type, NextPageID allocation
+  - `Close()`: Calls `pc.Close()` which flushes all dirty pages and closes file
 - Breadcrumb stack pattern (from Petrov): Tracks PageID and child index during descent for split/merge propagation
 - Child pointer management: After inserting promoted key at position i, updates record[i+1] or RightmostChild
 
 **Critical Implementation Details:**
 - Split propagation updates child pointers: When `[key, leftPageID]` inserted at index i, the next record (i+1) must point to rightPageID, or RightmostChild if last
 - Sibling chain maintenance: During SplitLeaf, `newPage.NextLeaf = oldPage.NextLeaf` then `oldPage.NextLeaf = newPageID`
-- **Header durability bug fix**: BTree modifies its own header copy (RootPageID, NextPageID), but DiskManager holds original. Must call `bt.dm.SetHeader(*bt.Header)` before `bt.dm.WriteHeader()` to sync changes. Implemented as defer at start of Insert.
+- **Header durability**: BTree modifies header via PageCache methods (SetRootPageID, AllocatePage, FreePage), FlushHeader syncs to disk. Implemented as defer at start of Insert/Delete.
+- **Pin/unpin discipline**: Every loadNode must have corresponding UnPin, typically via defer. New pages from AddNewPage also pinned.
+- **Tombstone-aware pointer updates**: After DeleteRecord in merge operations, must find next non-tombstone record to update child pointer (records don't shift with tombstone model)
 - Search safety: Max depth 100 prevents infinite loops from corrupted page structures
 - Primary key constraint: First field in schema must be int32 (cast to uint64 for key operations)
 
@@ -262,14 +296,15 @@ B+ tree page-based storage is **completed and fully integrated** with the CLI:
 - ✅ **Leaf write before underflow check**: Modified leaf must be written to disk BEFORE checking underflow (same pattern as parent fix)
 - ✅ **Cycle detection in RangeScan**: Detects corrupted leaf chains that visit pages twice
 - ✅ **Catastrophic durability bug**: Pages written to OS buffer but never synced. Fixed by adding `Sync()` to `WritePage()`. Caught via stress testing with 5000 concurrent inserts.
+- ✅ **Tombstone pointer updates**: After switching to tombstone model (no immediate Compact), merge operations must skip tombstone slots when updating parent pointers
 
 **Merge Algorithm Details:**
 - Prefers merging with left sibling (right into left) for consistency
 - Falls back to right sibling if no left sibling exists
 - Skips merge if combined size > PAGE_SIZE (accepts fragmentation, no borrowing yet)
-- **Leaf merge**: Updates NextLeaf chain (`merged.NextLeaf = orphaned.NextLeaf`), adds orphaned page to free list
-- **Internal merge**: Demotes separator key into merged node (`SerializeInternalRecord(separatorKey, leftNode.RightmostChild)`), adds orphaned page to free list
-- **Parent updates**: After `DeleteRecord(separatorIndex)`, slots shift - must update pointer at new `separatorIndex` position
+- **Leaf merge**: Calls Compact on both siblings first, updates NextLeaf chain (`merged.NextLeaf = orphaned.NextLeaf`), adds orphaned page to free list
+- **Internal merge**: Calls Compact on both siblings first, demotes separator key into merged node (`SerializeInternalRecord(separatorKey, leftNode.RightmostChild)`), adds orphaned page to free list
+- **Parent updates with tombstones**: After `DeleteRecord(separatorIndex)` creates tombstone, finds next non-tombstone record (separatorIndex+1, +2, etc.) to update child pointer
 
 **Free Page List Implementation:**
 - `allocatePage()`: Pops from FreePageIDs if available, otherwise increments NextPageID
@@ -278,13 +313,23 @@ B+ tree page-based storage is **completed and fully integrated** with the CLI:
 - Protected by BTreeStore's RWMutex (no separate mutex needed)
 - **Verified**: 501 inserts after merges consumed 0 new pages (all reused from free list)
 
+**Current Work - PageCache Integration:**
+- ✅ PageCache implementation with FIFO eviction
+- ✅ Pin/unpin semantics for in-use pages
+- ✅ BTree integrated with PageCache (loadNode/writeNode/Close)
+- ✅ Header management moved to PageCache
+- ✅ Tombstone-aware merge pointer updates
+- ✅ All unit tests passing (PageCache, BTree, Page)
+- 🔄 **Debugging**: Cache not evicting during chaos test, only 1 page flushed on exit despite 2390 pages allocated
+
 **Future Enhancements:**
+- Debug and fix cache eviction behavior (pages should flush during test, not just on exit)
 - Node borrowing/redistribution (when merge impossible due to size)
-- VACUUM command (rebuild tree compactly, truncate file to reclaim disk space)
-- Buffer pool for page caching (reduce fsync overhead, batch writes)
+- Optimize VACUUM with bulk loading (O(n) bottom-up build vs current O(n log n) insert-based)
 - Support non-int primary keys via hashing (currently first field must be int32)
 - Transaction support with ACID guarantees (WAL, ARIES recovery)
 - Page-level checksums and compression
+- Background flusher goroutine for async writes (skeleton exists in page_cache.go)
 
 ## Learning-Focused Interaction Guidelines
 
@@ -360,9 +405,13 @@ The user learns best through guided exploration, not guided implementation.
 ## Important Notes
 
 - **Primary key constraint**: First field of schema must be int32 type (cast to uint64 for B+ tree keys). Future: support arbitrary types via hashing.
-- **Free list race condition protection**: FreePageIDs has no explicit mutex, but it's safe because BTreeStore's RWMutex serializes all BTree access. Every operation that touches FreePageIDs (allocatePage during Insert, append during merge in Delete) holds the write lock.
-- **Performance trade-off**: Every WritePage() calls Sync() for durability. This makes INSERT/DELETE slow (~3.5ms per operation due to fsync). Will be optimized with buffer pool + batch commits.
+- **Free list race condition protection**: FreePageIDs has no explicit mutex, but it's safe because BTreeStore's RWMutex serializes all BTree access. Every operation that touches FreePageIDs (via pc.AllocatePage during Insert, pc.FreePage during merge in Delete) holds the write lock.
+- **PageCache concurrency**: PageCache.mu protects cache map and FIFO queue. BTreeStore.mu provides outer serialization for all BTree operations. Pin/unpin must be called within the same BTree operation scope.
+- **Cache size**: maxCacheSize = 50 pages. With 4KB pages, caches up to 200KB of data. Pages evicted when cache full and new page needed.
+- **Eviction and durability**: Dirty pages flushed to disk during eviction via flushRecord(). Close() flushes all remaining dirty pages. Header flushed via explicit FlushHeader() calls.
+- **Performance trade-off**: flushRecord() calls Sync() for durability during eviction. This ensures evicted pages persist, but adds latency. Future: batch writes, async flusher.
 - **Free list vs VACUUM**: Free list prevents file growth by reusing pages, but doesn't reclaim disk space. VACUUM needed to rebuild tree compactly and truncate file.
 - **Stress testing importance**: Catastrophic durability bug (100% data loss) only discovered through concurrent stress tests with restart verification.
-- consider adding a JSON/HTTP endpoint
-- make vacuum better than it is
+- **Tombstone model**: DeleteRecord marks slots as empty but doesn't compact immediately. Compact only called before merges. This requires special handling in merge operations to skip tombstones when updating parent pointers.
+- Consider adding a JSON/HTTP endpoint
+- Make VACUUM faster with bulk loading

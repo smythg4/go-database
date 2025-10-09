@@ -294,6 +294,13 @@ func commandExit(config *DatabaseConfig, params []string, w io.Writer) error {
 	fmt.Fprintln(w, "Closing Go-DB... goodbye!")
 
 	// if the client is remote, just close the connection
+	for name, v := range tableCache {
+		fmt.Printf("DEBUG: Closing table %s\n", name)
+		if err := v.Close(); err != nil {
+			fmt.Printf("Error closing %s: %v\n", name, err)
+			//return err
+		}
+	}
 	if conn, ok := w.(net.Conn); ok {
 		return conn.Close()
 	}

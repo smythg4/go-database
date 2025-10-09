@@ -77,11 +77,12 @@ func (bts *BTreeStore) Insert(record schema.Record) error {
 	bts.mu.Lock()
 	defer bts.mu.Unlock()
 
-	firstField := bts.bt.Header.Schema.Fields[0]
-	id := record[firstField.Name].(int32)
-	key := uint64(id)
+	key, err := bts.bt.ExtractPrimaryKey(record)
+	if err != nil {
+		return err
+	}
 
-	data, err := bts.bt.Header.Schema.SerializeRecord(record)
+	data, err := bts.bt.SerializeRecord(record)
 	if err != nil {
 		return err
 	}
@@ -90,8 +91,6 @@ func (bts *BTreeStore) Insert(record schema.Record) error {
 }
 
 func (bts *BTreeStore) Delete(key uint64) error {
-	// need to flush the cache. After massive delete test SELECT still shows results
-	// until I exit and try again
 	bts.mu.Lock()
 	defer bts.mu.Unlock()
 
@@ -109,7 +108,7 @@ func (bts *BTreeStore) Find(key int) (schema.Record, error) {
 	if !found {
 		return nil, fmt.Errorf("record %d not found", key)
 	}
-	_, result, err := bts.bt.Header.Schema.DeserializeRecord(data)
+	_, result, err := bts.bt.DeserializeRecord(data)
 	if err != nil {
 		return nil, err
 	}
@@ -127,7 +126,7 @@ func (bts *BTreeStore) RangeScan(startKey, endKey uint64) ([]schema.Record, erro
 
 	records := make([]schema.Record, 0, len(results))
 	for _, data := range results {
-		_, rec, err := bts.bt.Header.Schema.DeserializeRecord(data)
+		_, rec, err := bts.bt.DeserializeRecord(data)
 		if err != nil {
 			return nil, err
 		}
@@ -145,12 +144,11 @@ func (bts *BTreeStore) ScanAll() ([]schema.Record, error) {
 	return bts.RangeScan(0, math.MaxUint64)
 }
 func (bts *BTreeStore) Close() error {
-	// BTree doesn't need explicit closing, but we could sync here
-	return nil
+	return bts.bt.Close()
 }
 
 func (bts *BTreeStore) Schema() schema.Schema {
-	return bts.bt.Header.Schema
+	return bts.bt.GetSchema()
 }
 
 func (bts *BTreeStore) Stats() string {

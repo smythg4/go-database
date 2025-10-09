@@ -186,8 +186,11 @@ func (sp *SlottedPage) GetRecord(slotIndex int) ([]byte, error) {
 
 func (sp *SlottedPage) DeleteRecord(slotIndex int) error {
 	// tombstone markers
-	if slotIndex >= int(sp.NumSlots) {
+	if slotIndex >= len(sp.Records) {
 		return errors.New("slot out of range")
+	}
+	if sp.Records[slotIndex] == nil {
+		return errors.New("record already deleted")
 	}
 
 	sp.Slots[slotIndex].Offset = 0
@@ -210,11 +213,20 @@ func (sp *SlottedPage) findInsertionPosition(key uint64) int {
 	left, right := 0, len(sp.Records)
 	for left < right {
 		mid := (left + right) / 2
+		if sp.Records[mid] == nil {
+			// tombstone - move right
+			left = mid + 1
+			continue
+		}
 		if sp.GetKey(mid) < key {
 			left = mid + 1
 		} else {
 			right = mid
 		}
+	}
+	// skip any tombstones starting at left position
+	for left < len(sp.Records) && sp.Records[left] == nil {
+		left++
 	}
 	return left
 }
@@ -223,6 +235,11 @@ func (sp *SlottedPage) SearchInternal(key uint64) (PageID, int) {
 	left, right := 0, len(sp.Records)
 	for left < right {
 		mid := (left + right) / 2
+		if sp.Records[mid] == nil {
+			// tombstone - move right
+			left = mid + 1
+			continue
+		}
 		midKey := sp.GetKey(mid)
 		if midKey < key {
 			left = mid + 1
@@ -230,6 +247,12 @@ func (sp *SlottedPage) SearchInternal(key uint64) (PageID, int) {
 			right = mid
 		}
 	}
+
+	// skip any tombstones starting at left position
+	for left < len(sp.Records) && sp.Records[left] == nil {
+		left++
+	}
+
 	if left >= len(sp.Records) {
 		return sp.RightmostChild, -1
 	}
@@ -238,17 +261,34 @@ func (sp *SlottedPage) SearchInternal(key uint64) (PageID, int) {
 	return childPageID, left
 }
 
+// old binary search method - was struggling with tombstones
+// func (sp *SlottedPage) Search(key uint64) (int, bool) {
+// 	left, right := 0, len(sp.Records)
+// 	for left < right {
+// 		mid := (left + right) / 2
+// 		midKey := sp.GetKey(mid)
+// 		if midKey == key {
+// 			return mid, true
+// 		} else if midKey < key {
+// 			left = mid + 1
+// 		} else {
+// 			right = mid
+// 		}
+// 	}
+// 	return -1, false
+// }
+
 func (sp *SlottedPage) Search(key uint64) (int, bool) {
-	left, right := 0, len(sp.Records)
-	for left < right {
-		mid := (left + right) / 2
-		midKey := sp.GetKey(mid)
-		if midKey == key {
-			return mid, true
-		} else if midKey < key {
-			left = mid + 1
-		} else {
-			right = mid
+	for i := 0; i < len(sp.Records); i++ {
+		if sp.Records[i] == nil {
+			continue // skip tombstones
+		}
+		recordKey := sp.GetKey(i)
+		if recordKey == key {
+			return i, true
+		}
+		if recordKey > key {
+			break // records are sorted, no need to continue
 		}
 	}
 	return -1, false
@@ -298,6 +338,12 @@ func (sp *SlottedPage) SplitLeaf(newPageID PageID) (*SlottedPage, uint64, error)
 	if sp.PageType != LEAF {
 		return nil, 0, errors.New("attempting to split a non-leaf page as LEAF")
 	}
+
+	// Compact first to remove tombstones - NumSlots must equal len(Records)
+	if err := sp.Compact(); err != nil {
+		return nil, 0, err
+	}
+
 	mid := sp.NumSlots / 2
 	newPage := NewSlottedPage(newPageID, sp.PageType)
 	for i := mid; i < sp.NumSlots; i++ {
@@ -327,6 +373,12 @@ func (sp *SlottedPage) SplitInternal(newPageID PageID) (*SlottedPage, uint64, er
 	if sp.PageType != INTERNAL {
 		return nil, 0, errors.New("attempting to split a non-internal page as INTERNAL")
 	}
+
+	// Compact first to remove tombstones - NumSlots must equal len(Records)
+	if err := sp.Compact(); err != nil {
+		return nil, 0, err
+	}
+
 	mid := sp.NumSlots / 2
 	promotedKey := sp.GetKey(int(mid))
 	newPage := NewSlottedPage(newPageID, sp.PageType)
@@ -378,7 +430,7 @@ func (sp *SlottedPage) MergeLeaf(sibling *SlottedPage) error {
 	}
 
 	// copy all records from sibling to this page
-	for i := 0; i < int(sibling.NumSlots); i++ {
+	for i := 0; i < len(sibling.Records); i++ {
 		if sibling.Slots[i].Offset > 0 && sibling.Slots[i].Length > 0 {
 			_, err := sp.InsertRecordSorted(sibling.Records[i])
 			if err != nil {
@@ -408,7 +460,7 @@ func (sp *SlottedPage) MergeInternals(sibling *SlottedPage) error {
 	}
 
 	// copy all records from sibling to this page
-	for i := 0; i < int(sibling.NumSlots); i++ {
+	for i := 0; i < len(sibling.Records); i++ {
 		if sibling.Slots[i].Offset > 0 && sibling.Slots[i].Length > 0 {
 			_, err := sp.InsertRecordSorted(sibling.Records[i])
 			if err != nil {
