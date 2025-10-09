@@ -5,11 +5,13 @@ A from-scratch database implementation in Go, built to answer the question: 'How
 ## Features
 
 - **B+ Tree Storage Engine** - O(log n) insertions, lookups, and deletions with automatic page splitting
+- **Page Cache (Buffer Pool)** - 500-page FIFO cache with pin/unpin semantics, reduces disk I/O
 - **Page-Based Disk Format** - 4KB slotted pages with binary serialization
 - **Multi-Client TCP Server** - Concurrent connections on port 42069
 - **Dynamic Schema System** - User-defined tables with custom field types
 - **SQL-like Interface** - CREATE, INSERT, SELECT, UPDATE, DELETE, DESCRIBE, COUNT, DROP, VACUUM with primary key constraints
 - **Node Merging** - Automatic page merging when nodes become underfull after deletion
+- **Tombstone Deletion** - Mark-as-deleted pattern with lazy compaction, handles fragmentation during splits/merges
 - **Free Page List** - Orphaned pages from merges are tracked and reused, preventing file growth
 - **VACUUM** - Rebuild tree from leaf walk to reclaim disk space and fix fragmentation
 - **Range Queries** - Efficient range scans with O(log n + k) complexity via leaf sibling pointers
@@ -21,10 +23,11 @@ A from-scratch database implementation in Go, built to answer the question: 'How
 ## Points of Pride
 - **3,538x faster lookups** - Benchmarked against legacy append-only storage: 6.9μs vs 24ms for 10,000 record lookups. O(log n) vs O(n) in action.
 - **5,000 concurrent inserts, zero corruption** - Stress tested with 5 concurrent TCP clients hammering the database simultaneously. All data persists correctly.
-- **Chaos testing with concurrent deletes** - 5 clients running interleaved inserts and deletes (2,500 inserts, 1,017 deletes) with zero corruption. Free page list verified working.
+- **Chaos testing with concurrent deletes** - 5 clients running interleaved inserts and deletes (2,500 inserts, ~1,050 deletes) producing 1,449 surviving records across 41 pages. Zero corruption, proper page count (NextPageID=41, not 4829).
 - **Zero file growth from page reuse** - After chaos test, inserting 501 new records consumed 0 new pages (all reused from free list). NextPageID growth: 0.
 - **VACUUM reclaims disk space** - Rebuilt 1,500 record table from 40 pages down to 28 pages (30% reduction) via atomic temp file + rename. Zero data loss.
 - **Caught catastrophic durability bug** - Stress testing revealed 100% data loss on restart. Pages written to OS buffer but never synced to disk. Fixed by adding `Sync()` to `WritePage()`. 5,000 records now survive restart.
+- **Tombstone debugging saga** - Fixed 8 subtle bugs where `NumSlots` (active record count) was used instead of `len(Records)` (array size with tombstones). Symptoms: PageID burning (4829 pages for 49 records), records vanishing during merges, `Search` finding wrong keys. Fixed: linear scan for exact matches, `len(Records)` for bounds checks, Compact-before-split pattern.
 - **Breadcrumb stack for split propogation** - Implemented Petrov's breadcrumb pattern for bottom-up split cascading. Took 3 tries to get child pointer updates right.
 - **Full CRUD operations** - CREATE, INSERT, SELECT, UPDATE, DELETE all working with proper error handling and persistence.
 - **Write-before-recursion pattern** - Critical durability insight: write nodes before checking underflow to prevent stale pointers. Appears at both leaf and parent levels.
@@ -155,9 +158,11 @@ Root: page 1, Type: 0, NextPageID: 2, NumPages: 1, Tree Depth: 1
 - **Primary key constraints** - Unique constraint on first field (must be int32)
 - **Automatic splitting** - Leaf and internal nodes split when full, tree height grows dynamically
 
-### Concurrency
+### Concurrency & Caching
+- **PageCache (Buffer Pool)** - 500-page FIFO cache with pin/unpin discipline, automatic eviction of unpinned pages
+- **Pin/Unpin semantics** - Pages pinned during operations, unpinned via defer at function return (prevents premature eviction)
 - **Table cache** ensures single BTreeStore instance per file
-- **RWMutex protection** (writes locked, reads shared)
+- **RWMutex protection** (writes locked, reads shared) at BTreeStore level serializes all tree access
 - **Per-session state** for network clients
 
 ### Command Processing
@@ -263,7 +268,7 @@ Example hexdump showing header with B+ tree metadata:
 - **VACUUM uses O(n log n) inserts**: Simple implementation works but bulk loading would be 10-100x faster for large tables
 - **Primary key must be int32**: First field in schema must be int32 type
 - **No transactions**: Operations commit immediately, no rollback support
-- **No buffer pool**: Every page read/write hits disk (future optimization)
+- **Cache size fixed at 500 pages**: No LRU eviction policy yet, FIFO only (simple but functional)
 
 ## Learning Resources
 
@@ -285,15 +290,20 @@ The storage engine uses a fully functional B+ tree with the following characteri
 - **Stats** - Debug helper showing root page ID, node type (LEAF/INTERNAL), and NextPageID allocation
 
 **Key Implementation Details:**
+- **PageCache (Buffer Pool)** - 500-page FIFO cache with pin/unpin discipline; pages pinned during use, unpinned via defer; evicts unpinned pages when full
+- **Pin/Unpin discipline** - `loadNode()` fetches and pins page, defer unpins at function exit; prevents premature eviction during multi-page operations
 - **Slotted pages** - 4KB fixed pages with 13-byte headers, slot arrays growing downward, records growing upward
-- **Binary search** - Sorted insertion and lookup within pages
+- **Binary search** - Sorted insertion and lookup within pages (internal nodes); linear scan for exact matches in leaves (tombstone-safe)
+- **Tombstone handling** - Critical: `NumSlots` = active count, `len(Records)` = array size with tombstones; all iteration uses `len(Records)`, bounds checks use `len(Records)`
+- **Tombstone deletion** - DeleteRecord() marks slot as empty (Offset=0, Records[i]=nil), NumSlots--, then Compact() during splits/merges removes gaps
+- **Compact-before-split** - SplitLeaf/SplitInternal call Compact() first to ensure NumSlots == len(Records), prevents nil record insertion errors
+- **Search with tombstones** - Leaf search uses linear scan (not binary) because tombstones break binary search logic; early exit when key > target
 - **Breadcrumb stack** - Tracks descent path for bottom-up split/merge propagation (pattern from Petrov's "Database Internals")
 - **Sibling pointers** - Leaf nodes linked for efficient range scans (B+ tree characteristic)
 - **Child pointer management** - After inserting promoted key at index i, updates record[i+1] or RightmostChild
 - **Header durability** - Defer pattern syncs BTree header changes (RootPageID, NextPageID, FreePageIDs) back to DiskManager before write
 - **Primary key uniqueness** - Search before insert, error on duplicate key (PostgreSQL-style behavior)
-- **Tombstone deletion** - DeleteRecord() marks slot as empty (Offset=0), then Compact() removes gaps
-- **Merge strategy** - Prefer left sibling, merge left-into-right, demote separator key for internal nodes
+- **Merge strategy** - Prefer left sibling, merge left-into-right, demote separator key for internal nodes; iterate over `len(Records)` not NumSlots
 - **Free page list** - allocatePage() pops from FreePageIDs before allocating new pages; merge operations append orphaned pages to list
 - **Write-before-recursion** - Critical pattern: write leaf before checking underflow, write parent before checking parent underflow
 - **Root collapse** - When internal root has only RightmostChild, promote it to new root
@@ -310,7 +320,8 @@ The storage engine uses a fully functional B+ tree with the following characteri
 **Future Enhancements:**
 - Bulk loading for VACUUM (O(n) bottom-up build vs current O(n log n) insert-based approach)
 - Node borrowing (currently merge-only, no borrowing from siblings)
-- Buffer pool for page caching (reduce disk I/O)
+- LRU eviction policy for PageCache (currently FIFO only)
+- Async background flusher for dirty pages (reduce fsync overhead, batch writes)
 - Support non-int primary keys via hashing (currently first field must be int32)
 - Transaction support with ACID guarantees (WAL, ARIES recovery)
 - True in-place UPDATE (currently uses DELETE + INSERT pattern)

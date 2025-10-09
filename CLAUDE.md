@@ -68,7 +68,7 @@ A handrolled database implementation in Go with multi-client TCP server support,
 ### B+ Tree Storage Engine (`internal/pager` + `internal/btree`)
 
 **Page Cache Layer (`internal/pager/page_cache.go`)** - Buffer pool for page caching:
-- `PageCache`: In-memory cache with FIFO eviction policy (maxCacheSize = 50 pages)
+- `PageCache`: In-memory cache with FIFO eviction policy (maxCacheSize = 500 pages)
 - `CacheRecord`: Tracks page data, dirty flag, and pin count for each cached page
 - Pin/unpin semantics prevent eviction of in-use pages during tree operations
 - Key methods:
@@ -86,7 +86,7 @@ A handrolled database implementation in Go with multi-client TCP server support,
 - **Eviction strategy**: Pages skipped if pinned, moved to back of FIFO queue if pinned
 - **Header management**: PageCache owns header pointer, BTree accesses via Get/Set methods
 - **Concurrency**: PageCache.mu protects cache map and queue, BTreeStore.mu serializes BTree access
-- **Current status**: Implementation in progress, debugging cache flush behavior
+- **Cache size increased**: Originally 50 pages, increased to 500 to handle deep tree operations where single Insert with cascading splits can pin >50 pages before defers execute
 
 **Page Layer (`internal/pager/page.go`)** - Slotted page implementation:
 - `SlottedPage`: In-memory representation with 13-byte header, slot array, and records
@@ -96,21 +96,23 @@ A handrolled database implementation in Go with multi-client TCP server support,
   - 4KB fixed page size (PAGE_SIZE = 4096)
 - Key methods:
   - `InsertRecordSorted`: Binary search insertion maintaining key order
-  - `DeleteRecord`: Tombstone approach (mark Offset=0, Length=0, Records[i]=nil)
-  - `Search`: Binary search for exact key match in leaf nodes, skips tombstones
-  - `SearchInternal`: Routes search to correct child page in internal nodes, skips tombstones
-  - `SplitLeaf/SplitInternal`: Node splitting with promoted key handling and child pointer updates
-  - `MergeLeaf/MergeInternals`: Combine two nodes (updates NextLeaf chain for leaves), calls Compact first
+  - `DeleteRecord`: Tombstone approach (mark Offset=0, Length=0, Records[i]=nil, NumSlots--), bounds check uses `len(Records)` not NumSlots
+  - `Search`: **Linear scan** for exact key match in leaf nodes (binary search breaks with tombstones), skips nil Records, early exit when key > target
+  - `SearchInternal`: Routes search to correct child page in internal nodes, binary search with tombstone skip (moves right when mid is tombstone)
+  - `findInsertionPosition`: Binary search for insertion position, skips tombstones during search
+  - `SplitLeaf/SplitInternal`: Node splitting with promoted key handling and child pointer updates, **calls Compact() first** to ensure NumSlots == len(Records)
+  - `MergeLeaf/MergeInternals`: Combine two nodes (updates NextLeaf chain for leaves), iterates over `len(sibling.Records)` not NumSlots, calls Compact first
   - `CanMergeWith`: Check if two pages fit together (combined size + slot overhead ≤ PAGE_SIZE)
   - `IsUnderfull`: Returns true if GetUsedSpace() < PAGE_SIZE/2
   - `GetUsedSpace()`: Calculates space used by active records only (skips tombstones where Offset=0)
-  - `Compact`: Removes tombstone gaps by repacking active records, called before merges
+  - `Compact`: Removes tombstone gaps by repacking active records, called before splits/merges
   - `Serialize/Deserialize`: Convert between in-memory (13-byte header) and disk ([4096]byte array)
 - Record formats:
   - Leaf: [key: 8 bytes][full record data: variable]
   - Internal: [key: 8 bytes][child PageID: 4 bytes]
 - First field in schema is always the key
-- **Tombstone model**: DeleteRecord doesn't compact immediately, allows tombstones to accumulate, Compact called only before merges
+- **Tombstone model**: DeleteRecord doesn't compact immediately, allows tombstones to accumulate, Compact called only before splits/merges
+- **Critical tombstone bug pattern**: `NumSlots` = active record count (decrements on delete), `len(Records)` = array size with tombstones. ALL iteration must use `len(Records)`, ALL bounds checks must use `len(Records)`. Using NumSlots causes records at high indices to be skipped.
 
 **Table Metadata (`internal/pager/header.go`)**:
 - `TableHeader`: Magic ("GDBT"), version, RootPageID, NextPageID, NumPages, Schema, FreePageIDs
@@ -159,9 +161,10 @@ A handrolled database implementation in Go with multi-client TCP server support,
     - **Tombstone handling**: After DeleteRecord, finds next non-tombstone record to update pointer (records don't shift)
   - `findLeftSibling/findRightSibling`: Navigates parent to locate merge partners
   - `Search`: Descends tree using SearchInternal/Search, max depth check prevents infinite loops
-  - `RangeScan`: Follows NextLeaf sibling chain with cycle detection
+  - `RangeScan`: Follows NextLeaf sibling chain with cycle detection, iterates over `len(leaf.Records)` not NumSlots to include all records
   - `Stats()`: Debug helper showing root page ID, type, NextPageID allocation
   - `Close()`: Calls `pc.Close()` which flushes all dirty pages and closes file
+  - `findLeftSibling/findRightSibling`: Skip tombstones when navigating parent records to find siblings (backward/forward scan)
 - Breadcrumb stack pattern (from Petrov): Tracks PageID and child index during descent for split/merge propagation
 - Child pointer management: After inserting promoted key at position i, updates record[i+1] or RightmostChild
 
@@ -296,7 +299,16 @@ B+ tree page-based storage is **completed and fully integrated** with the CLI:
 - ✅ **Leaf write before underflow check**: Modified leaf must be written to disk BEFORE checking underflow (same pattern as parent fix)
 - ✅ **Cycle detection in RangeScan**: Detects corrupted leaf chains that visit pages twice
 - ✅ **Catastrophic durability bug**: Pages written to OS buffer but never synced. Fixed by adding `Sync()` to `WritePage()`. Caught via stress testing with 5000 concurrent inserts.
-- ✅ **Tombstone pointer updates**: After switching to tombstone model (no immediate Compact), merge operations must skip tombstone slots when updating parent pointers
+- ✅ **8 Tombstone bugs** (NumSlots vs len(Records) confusion):
+  1. `Search` in leaf nodes - binary search breaks with tombstones (GetKey returns 0), fixed with linear scan
+  2. `DeleteRecord` bounds check - used NumSlots, fixed to use len(Records)
+  3. `RangeScan` iteration - used NumSlots, skipped high-index records, fixed to use len(Records)
+  4. `MergeLeaf` iteration - used sibling.NumSlots, orphaned records, fixed to use len(sibling.Records)
+  5. `MergeInternals` iteration - same issue, fixed to use len(sibling.Records)
+  6. `SplitLeaf` iteration - used NumSlots as index bound with tombstone array, caused nil insertions, fixed with Compact-first pattern
+  7. `SplitInternal` iteration - same issue, fixed with Compact-first pattern
+  8. `findRightSibling` deserialization - accessed childIndex+1 without tombstone check, fixed with forward scan
+- ✅ **Symptoms caught**: NextPageID burning (4829 pages for 49 records), records vanishing (103-146 missing), wrong key deletions (deleted 101-109 instead of staying)
 
 **Merge Algorithm Details:**
 - Prefers merging with left sibling (right into left) for consistency
@@ -313,23 +325,25 @@ B+ tree page-based storage is **completed and fully integrated** with the CLI:
 - Protected by BTreeStore's RWMutex (no separate mutex needed)
 - **Verified**: 501 inserts after merges consumed 0 new pages (all reused from free list)
 
-**Current Work - PageCache Integration:**
-- ✅ PageCache implementation with FIFO eviction
+**✅ PageCache Integration (COMPLETED):**
+- ✅ PageCache implementation with FIFO eviction (500 pages)
 - ✅ Pin/unpin semantics for in-use pages
 - ✅ BTree integrated with PageCache (loadNode/writeNode/Close)
 - ✅ Header management moved to PageCache
-- ✅ Tombstone-aware merge pointer updates
+- ✅ All 8 tombstone bugs fixed (NumSlots vs len(Records) pattern)
+- ✅ Compact-before-split pattern prevents nil record insertion
+- ✅ Linear scan for leaf Search (tombstone-safe)
 - ✅ All unit tests passing (PageCache, BTree, Page)
-- 🔄 **Debugging**: Cache not evicting during chaos test, only 1 page flushed on exit despite 2390 pages allocated
+- ✅ Stress testing: Chaos test shows 1,449 records across 41 pages (NextPageID=41, not 4829)
 
 **Future Enhancements:**
-- Debug and fix cache eviction behavior (pages should flush during test, not just on exit)
 - Node borrowing/redistribution (when merge impossible due to size)
+- LRU eviction policy (currently FIFO only)
+- Async background flusher for dirty pages (reduce fsync overhead, batch writes)
 - Optimize VACUUM with bulk loading (O(n) bottom-up build vs current O(n log n) insert-based)
 - Support non-int primary keys via hashing (currently first field must be int32)
 - Transaction support with ACID guarantees (WAL, ARIES recovery)
 - Page-level checksums and compression
-- Background flusher goroutine for async writes (skeleton exists in page_cache.go)
 
 ## Learning-Focused Interaction Guidelines
 
@@ -407,11 +421,13 @@ The user learns best through guided exploration, not guided implementation.
 - **Primary key constraint**: First field of schema must be int32 type (cast to uint64 for B+ tree keys). Future: support arbitrary types via hashing.
 - **Free list race condition protection**: FreePageIDs has no explicit mutex, but it's safe because BTreeStore's RWMutex serializes all BTree access. Every operation that touches FreePageIDs (via pc.AllocatePage during Insert, pc.FreePage during merge in Delete) holds the write lock.
 - **PageCache concurrency**: PageCache.mu protects cache map and FIFO queue. BTreeStore.mu provides outer serialization for all BTree operations. Pin/unpin must be called within the same BTree operation scope.
-- **Cache size**: maxCacheSize = 50 pages. With 4KB pages, caches up to 200KB of data. Pages evicted when cache full and new page needed.
+- **Cache size**: maxCacheSize = 500 pages (increased from 50). With 4KB pages, caches up to 2MB of data. Increase necessary because single Insert with cascading splits can pin >50 pages before defers execute.
 - **Eviction and durability**: Dirty pages flushed to disk during eviction via flushRecord(). Close() flushes all remaining dirty pages. Header flushed via explicit FlushHeader() calls.
 - **Performance trade-off**: flushRecord() calls Sync() for durability during eviction. This ensures evicted pages persist, but adds latency. Future: batch writes, async flusher.
 - **Free list vs VACUUM**: Free list prevents file growth by reusing pages, but doesn't reclaim disk space. VACUUM needed to rebuild tree compactly and truncate file.
-- **Stress testing importance**: Catastrophic durability bug (100% data loss) only discovered through concurrent stress tests with restart verification.
-- **Tombstone model**: DeleteRecord marks slots as empty but doesn't compact immediately. Compact only called before merges. This requires special handling in merge operations to skip tombstones when updating parent pointers.
+- **Stress testing importance**: Catastrophic durability bug (100% data loss) and all 8 tombstone bugs only discovered through concurrent stress tests with restart verification and chaos testing.
+- **Tombstone model critical pattern**: `NumSlots` = active record count (decrements on delete), `len(Records)` = array size with tombstones. ALWAYS use `len(Records)` for iteration and bounds checks. Using NumSlots causes silent data loss (records at high indices skipped).
+- **Linear scan for leaf Search**: Binary search breaks with tombstones because `GetKey(mid)` returns 0 for nil records, making comparison logic incorrect. Linear scan is simple, correct, and fast enough for small leaf pages (~50-100 records).
+- **Compact-before-split**: SplitLeaf/SplitInternal must call Compact() first to ensure NumSlots == len(Records), preventing nil record insertion errors.
 - Consider adding a JSON/HTTP endpoint
 - Make VACUUM faster with bulk loading
