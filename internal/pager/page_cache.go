@@ -2,6 +2,7 @@ package pager
 
 import (
 	"errors"
+	"fmt"
 	"sync"
 	"time"
 )
@@ -57,18 +58,56 @@ func NewCacheRecord(sp *SlottedPage) CacheRecord {
 type PageCache struct {
 	fifoQueue []PageID
 	cache     map[PageID]*CacheRecord
-	header    TableHeader
+	header    *TableHeader
 	dm        *DiskManager
 	mu        sync.Mutex
 }
 
-func NewPageCache(dm *DiskManager, th TableHeader) PageCache {
+func NewPageCache(dm *DiskManager, th *TableHeader) PageCache {
 	return PageCache{
 		fifoQueue: []PageID{},
 		cache:     make(map[PageID]*CacheRecord, maxCacheSize),
 		header:    th,
 		dm:        dm,
 	}
+}
+
+func (pc *PageCache) AllocatePage() PageID {
+	if len(pc.header.FreePageIDs) > 0 {
+		pageID := pc.header.FreePageIDs[len(pc.header.FreePageIDs)-1]
+		pc.header.FreePageIDs = pc.header.FreePageIDs[:len(pc.header.FreePageIDs)-1]
+		return pageID
+	}
+
+	pageID := pc.header.NextPageID
+	pc.header.NextPageID++
+	return pageID
+}
+
+func (pc *PageCache) AddNewPage(sp *SlottedPage) error {
+	pc.mu.Lock()
+	defer pc.mu.Unlock()
+
+	if _, exists := pc.cache[sp.PageID]; exists {
+		return fmt.Errorf("page %d already cached", sp.PageID)
+	}
+
+	if err := pc.CachePage(sp); err != nil {
+		return err
+	}
+	return pc.MakeDirty(sp.PageID)
+}
+
+func (pc *PageCache) FreePage(id PageID) {
+	pc.header.FreePageIDs = append(pc.header.FreePageIDs, id)
+}
+
+func (pc *PageCache) GetRootPageID() PageID {
+	return pc.header.RootPageID
+}
+
+func (pc *PageCache) SetRootPageID(id PageID) {
+	pc.header.RootPageID = id
 }
 
 func (pc *PageCache) Fetch(id PageID) (sp *SlottedPage, err error) {
@@ -230,4 +269,13 @@ func (pc *PageCache) UnPin(id PageID) {
 	if exists {
 		cr.pinCount--
 	}
+}
+
+func (pc *PageCache) GetHeader() *TableHeader {
+	return pc.header
+}
+
+func (pc *PageCache) FlushHeader() error {
+	pc.dm.SetHeader(*pc.header)
+	return pc.dm.WriteHeader()
 }

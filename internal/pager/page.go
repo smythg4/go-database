@@ -39,7 +39,15 @@ type Page struct {
 }
 
 func (sp *SlottedPage) GetUsedSpace() uint16 {
-	return PAGE_SIZE - sp.FreeSpacePtr
+	slotArraySize := 13 + (len(sp.Slots) * 4) // header + slot array
+	dataSize := 0
+
+	for _, slot := range sp.Slots {
+		if slot.Offset > 0 { // skip tombstones
+			dataSize += int(slot.Length)
+		}
+	}
+	return uint16(slotArraySize + dataSize)
 }
 
 func (sp *SlottedPage) IsUnderfull() bool {
@@ -177,9 +185,7 @@ func (sp *SlottedPage) GetRecord(slotIndex int) ([]byte, error) {
 }
 
 func (sp *SlottedPage) DeleteRecord(slotIndex int) error {
-	// want to update to a tombstone approach where we just 0 values in sp.Slots
-	// compact will then clean it up. Will need to update GetKey, Search, etc to check
-	// if Offset == 0 and skip them
+	// tombstone markers
 	if slotIndex >= int(sp.NumSlots) {
 		return errors.New("slot out of range")
 	}
@@ -189,8 +195,7 @@ func (sp *SlottedPage) DeleteRecord(slotIndex int) error {
 	sp.Records[slotIndex] = nil
 	sp.NumSlots--
 
-	// this is inefficient, but maximizes available space
-	return sp.Compact()
+	return nil
 }
 
 func (sp *SlottedPage) GetKey(slotIndex int) uint64 {
@@ -363,6 +368,11 @@ func (sp *SlottedPage) MergeLeaf(sibling *SlottedPage) error {
 		return errors.New("both pages must be leaf pages")
 	}
 
+	// compact to remove tombstones first (maybe inefficient, but works for now)
+	if err := sp.Compact(); err != nil {
+		return err
+	}
+
 	if !sp.CanMergeWith(sibling) {
 		return errors.New("pages too large to merge")
 	}
@@ -386,6 +396,11 @@ func (sp *SlottedPage) MergeLeaf(sibling *SlottedPage) error {
 func (sp *SlottedPage) MergeInternals(sibling *SlottedPage) error {
 	if sp.PageType != INTERNAL || sibling.PageType != INTERNAL {
 		return errors.New("all pages must be INTERNAL")
+	}
+
+	// compact to remove tombstones first (maybe inefficient, but works for now)
+	if err := sp.Compact(); err != nil {
+		return err
 	}
 
 	if !sp.CanMergeWith(sibling) {

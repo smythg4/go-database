@@ -511,3 +511,83 @@ func TestInternalSplit(t *testing.T) {
 		t.Errorf("Right page RightmostChild: expected 100, got %d", newPage.RightmostChild)
 	}
 }
+
+func TestFragmentedMerge(t *testing.T) {
+	sch := schema.Schema{
+		TableName: "test",
+		Fields: []schema.Field{
+			{Name: "id", Type: schema.IntType},
+			{Name: "value", Type: schema.StringType},
+		},
+	}
+
+	// Create two leaf pages
+	leftPage := NewSlottedPage(1, LEAF)
+	rightPage := NewSlottedPage(2, LEAF)
+
+	// Insert 5 records into left page
+	for i := 1; i <= 5; i++ {
+		rec := schema.Record{"id": int32(i * 10), "value": "left"}
+		data, _ := sch.SerializeRecord(rec)
+		leftPage.InsertRecordSorted(data)
+	}
+
+	// Insert 3 records into right page
+	for i := 6; i <= 8; i++ {
+		rec := schema.Record{"id": int32(i * 10), "value": "right"}
+		data, _ := sch.SerializeRecord(rec)
+		rightPage.InsertRecordSorted(data)
+	}
+
+	// Delete some records to create tombstones (fragmentation)
+	leftPage.DeleteRecord(1)  // Delete id=20
+	leftPage.DeleteRecord(2)  // Delete id=30 (was at index 3, now at 2 after first delete shifts)
+
+	// Check fragmentation: NumSlots decreased, but len(Slots) still has tombstones
+	if leftPage.NumSlots != 3 {
+		t.Errorf("Expected 3 active slots after deletes, got %d", leftPage.NumSlots)
+	}
+	if len(leftPage.Slots) != 5 {
+		t.Errorf("Expected 5 total slots (including tombstones), got %d", len(leftPage.Slots))
+	}
+
+	// Check that pages can merge
+	if !leftPage.CanMergeWith(rightPage) {
+		t.Fatal("Pages should be able to merge")
+	}
+
+	// Record keys before merge
+	expectedKeys := []uint64{10, 40, 50, 60, 70, 80} // 3 from left (20,30 deleted) + 3 from right
+
+	// Merge right into left
+	err := leftPage.MergeLeaf(rightPage)
+	if err != nil {
+		t.Fatalf("MergeLeaf failed: %v", err)
+	}
+
+	// After merge, should have 6 active records
+	if leftPage.NumSlots != 6 {
+		t.Errorf("Expected 6 active slots after merge, got %d", leftPage.NumSlots)
+	}
+
+	// Should have no tombstones (compact was called during merge)
+	if len(leftPage.Slots) != 6 {
+		t.Errorf("Expected 6 total slots (no tombstones), got %d", len(leftPage.Slots))
+	}
+
+	// Verify all keys are present and in order
+	for i, expectedKey := range expectedKeys {
+		actualKey := leftPage.GetKey(i)
+		if actualKey != expectedKey {
+			t.Errorf("Key at index %d: expected %d, got %d", i, expectedKey, actualKey)
+		}
+	}
+
+	// Verify all records are accessible (no tombstones)
+	for i := 0; i < int(leftPage.NumSlots); i++ {
+		_, err := leftPage.GetRecord(i)
+		if err != nil {
+			t.Errorf("Failed to get record at index %d: %v", i, err)
+		}
+	}
+}
