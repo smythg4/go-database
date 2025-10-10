@@ -30,6 +30,9 @@ go.work.sum
 # db files
 *.db
 
+# log files
+*.log
+
 # binaries
 godb
 
