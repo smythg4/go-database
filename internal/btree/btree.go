@@ -16,7 +16,7 @@ type BTree struct {
 func NewBTree(dm *pager.DiskManager, header *pager.TableHeader) *BTree {
 	npc := pager.NewPageCache(dm, header)
 	return &BTree{
-		pc: &npc,
+		pc: npc,
 	}
 }
 

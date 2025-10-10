@@ -6,46 +6,16 @@ import (
 	"godb/internal/schema"
 	"os"
 	"sync"
-	"time"
 )
 
-// background flusher for future use
-func (pc *PageCache) backgroundFlusher(pagesToWrite <-chan PageID) error {
-	// will need a terminate signal
-
-	batch := make([]PageID, 0, 10)
-	ticker := time.NewTicker(100 * time.Millisecond) // you can play with this timinig
-
-	for {
-		select {
-		case pg := <-pagesToWrite:
-			batch = append(batch, pg)
-			if len(batch) >= 10 {
-				if err := pc.flushBatch(batch); err != nil {
-					return err
-				}
-				batch = batch[:0]
-			}
-		case <-ticker.C:
-			if len(batch) > 0 {
-				if err := pc.flushBatch(batch); err != nil {
-					return err
-				}
-				batch = batch[:0]
-			}
-		}
-	}
-
-	return nil
-}
-
-const maxCacheSize = 50
+const maxCacheSize = 200
 
 type CacheRecord struct {
 	id       PageID
 	data     *SlottedPage
 	isDirty  bool
 	pinCount int
+	refBit   bool
 }
 
 func NewCacheRecord(sp *SlottedPage) CacheRecord {
@@ -54,24 +24,31 @@ func NewCacheRecord(sp *SlottedPage) CacheRecord {
 		data:     sp,
 		isDirty:  false,
 		pinCount: 0,
+		refBit:   false,
 	}
 }
 
 type PageCache struct {
-	fifoQueue []PageID
-	cache     map[PageID]*CacheRecord
-	header    *TableHeader
-	dm        *DiskManager
-	mu        sync.Mutex
+	//dirtyPageChan chan PageID
+	clockQueue []PageID
+	clockHand  int
+	cache      map[PageID]*CacheRecord
+	header     *TableHeader
+	dm         *DiskManager
+	mu         sync.Mutex
 }
 
-func NewPageCache(dm *DiskManager, th *TableHeader) PageCache {
-	return PageCache{
-		fifoQueue: []PageID{},
-		cache:     make(map[PageID]*CacheRecord, maxCacheSize),
-		header:    th,
-		dm:        dm,
+func NewPageCache(dm *DiskManager, th *TableHeader) *PageCache {
+	pc := PageCache{
+		//dirtyPageChan: make(chan PageID, 100),
+		clockQueue: make([]PageID, maxCacheSize),
+		clockHand:  0,
+		cache:      make(map[PageID]*CacheRecord, maxCacheSize),
+		header:     th,
+		dm:         dm,
 	}
+	//go pc.backgroundFlusher()
+	return &pc
 }
 
 func (pc *PageCache) AllocatePage() PageID {
@@ -112,11 +89,9 @@ func (pc *PageCache) FreePage(id PageID) {
 	// remove the page from the cache -- forcefully
 	delete(pc.cache, id)
 
-	// remove from the fifoQueue if present
-	for i, qid := range pc.fifoQueue {
+	for i, qid := range pc.clockQueue {
 		if qid == id {
-			pc.fifoQueue = append(pc.fifoQueue[:i], pc.fifoQueue[i+1:]...)
-			// keep it going just in case there's duplicates
+			pc.clockQueue[i] = 0
 		}
 	}
 	pc.header.FreePageIDs = append(pc.header.FreePageIDs, id)
@@ -151,32 +126,28 @@ func (pc *PageCache) Fetch(id PageID) (sp *SlottedPage, err error) {
 	}
 
 	// Slotted Page found in cache
+	cr.refBit = true
 	cr.pinCount++
 	return cr.data, nil
 }
 
 func (pc *PageCache) CachePage(sp *SlottedPage) error {
-	// check the cache to see if it's already there
-	_, exists := pc.cache[sp.PageID]
-	if exists {
-		return nil
-	}
-
-	// if cache is full, initiate an eviction
-	if len(pc.cache) >= maxCacheSize {
-		fmt.Printf("DEBUG: Cache FULL (%d pages), evicting to make room for page %d\n", len(pc.cache), sp.PageID)
+	// find empty slot or evict
+	for pc.clockQueue[pc.clockHand] != 0 {
+		fmt.Printf("DEBUG: Clock sweeping (cache %d/%d), need room for page %d\n",
+			len(pc.cache), maxCacheSize, sp.PageID)
 		if err := pc.Evict(); err != nil {
+			fmt.Printf("ERROR: flushRecord failed for page %d: %v\n", sp.PageID, err)
 			return err
 		}
-		if len(pc.cache) >= maxCacheSize {
-			return errors.New("unable to evict cache to make room")
-		}
 	}
 
-	// cache the page and update the fifoQueue
+	// insert at current position
 	ncr := NewCacheRecord(sp)
+	ncr.refBit = true
 	pc.cache[sp.PageID] = &ncr
-	pc.fifoQueue = append(pc.fifoQueue, sp.PageID)
+	pc.clockQueue[pc.clockHand] = sp.PageID
+	pc.advanceClock()
 	return nil
 }
 
@@ -186,44 +157,66 @@ func (pc *PageCache) MakeDirty(id PageID) error {
 		return errors.New("attempting to dirty a page that isn't cached")
 	}
 	cr.isDirty = true
+	// select {
+	// case pc.dirtyPageChan <- id:
+	// default:
+	// }
 	return nil
 }
 
 func (pc *PageCache) Evict() error {
-	pinnedSkips := 0
-	for len(pc.fifoQueue) > 0 {
-		id := pc.fifoQueue[0]
-		cr, exists := pc.cache[id]
+	startPos := pc.clockHand
 
-		if !exists {
-			// stale entry, skip it
-			pc.fifoQueue = pc.fifoQueue[1:]
+	for {
+		// get page at clock hand
+		id := pc.clockQueue[pc.clockHand]
+		cr := pc.cache[id]
+
+		if cr == nil {
+			// stale entry, skip
+			pc.advanceClock()
 			continue
 		}
 
 		if cr.pinCount > 0 {
-			// pinned, skip for now
-			pc.fifoQueue = pc.fifoQueue[1:]
-			pc.fifoQueue = append(pc.fifoQueue, cr.id)
-			pinnedSkips++
+			// pinned, skip (but don't clear refBit)
+			pc.advanceClock()
+
+			// detect full rotation through all pinned pages
+			if pc.clockHand == startPos {
+				return errors.New("all pages pinned")
+			}
 			continue
 		}
 
-		if cr.isDirty {
-			if err := pc.flushRecord(cr); err != nil {
-				return err
-			}
-			fmt.Printf("DEBUG: Evicted dirty page %d (pinned skips: %d, cache size: %d)\n", id, pinnedSkips, len(pc.cache))
-		} else {
-			fmt.Printf("DEBUG: Evicted clean page %d (pinned skips: %d, cache size: %d)\n", id, pinnedSkips, len(pc.cache))
+		if cr.refBit {
+			// give second chance
+			cr.refBit = false
+			pc.advanceClock()
+			continue
 		}
 
-		pc.fifoQueue = pc.fifoQueue[1:]
+		// found victim (unpinned, refBit=0)
+		fmt.Printf("DEBUG: Evicting page %d (dirty=%v) at position %d\n", id, cr.isDirty,
+			pc.clockHand)
+		if cr.isDirty {
+			if err := pc.flushRecord(cr); err != nil {
+				fmt.Printf("ERROR: flushRecord failed for page %d: %v\n", id, err)
+				return err
+			}
+		}
+
 		delete(pc.cache, id)
+		pc.clockQueue[pc.clockHand] = 0
+		fmt.Printf("DEBUG: Successfully evicted page %d, cache now %d/%d\n", id,
+			len(pc.cache), maxCacheSize)
 		return nil
 	}
-	fmt.Printf("DEBUG: Evict FAILED - all %d pages pinned\n", len(pc.cache))
-	return errors.New("all pages pinned")
+
+}
+
+func (pc *PageCache) advanceClock() {
+	pc.clockHand = (pc.clockHand + 1) % len(pc.clockQueue)
 }
 
 func (pc *PageCache) writeRecord(cr *CacheRecord) error {
@@ -339,7 +332,8 @@ func (pc *PageCache) UpdateFile(file *os.File) error {
 	pc.mu.Lock()
 	defer pc.mu.Unlock()
 	pc.cache = make(map[PageID]*CacheRecord, maxCacheSize)
-	pc.fifoQueue = []PageID{}
+	pc.clockQueue = make([]PageID, maxCacheSize)
+	pc.clockHand = 0
 	return nil
 }
 
