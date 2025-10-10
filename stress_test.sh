@@ -17,5 +17,6 @@
       echo "select 149"
       echo "select"
       echo "stats"
+      echo ".exit"
 
   } | nc localhost 42069

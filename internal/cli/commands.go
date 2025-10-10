@@ -141,9 +141,9 @@ func init() {
 
 func commandVacuum(config *DatabaseConfig, params []string, w io.Writer) error {
 	fmt.Fprintf(w, "Vacuuming up table %s...\n", config.TableS.Schema().TableName)
-	if err := config.TableS.Vacuum(); err != nil {
-		return err
-	}
+
+	err := config.TableS.Vacuum() // save error for future use so you can always refresh the table cache
+
 	tableName := config.TableS.Schema().TableName
 	fName := tableName + ".db"
 
@@ -153,11 +153,15 @@ func commandVacuum(config *DatabaseConfig, params []string, w io.Writer) error {
 	tableCacheMu.Unlock()
 
 	// Reload the table fresh from disk
-	freshTable, err := GetOrOpenTable(fName)
-	if err != nil {
-		return fmt.Errorf("failed to reload after vacuum: %v", err)
+	freshTable, reloadErr := GetOrOpenTable(fName)
+	if reloadErr != nil {
+		return fmt.Errorf("failed to reload after vacuum: %v", reloadErr)
 	}
 	config.TableS = freshTable
+
+	if err != nil {
+		return fmt.Errorf("vacuum failed: %v", err)
+	}
 
 	fmt.Fprintf(w, "Vacuum complete.\n")
 	return nil
@@ -313,14 +317,14 @@ func commandHelp(config *DatabaseConfig, params []string, w io.Writer) error {
 func commandExit(config *DatabaseConfig, params []string, w io.Writer) error {
 	fmt.Fprintln(w, "Closing Go-DB... goodbye!")
 
-	// if the client is remote, just close the connection
-	for name, v := range tableCache {
-		fmt.Printf("DEBUG: Closing table %s\n", name)
-		if err := v.Close(); err != nil {
-			fmt.Printf("Error closing %s: %v\n", name, err)
-			//return err
-		}
-	}
+	// // if the client is remote, just close the connection
+	// for name, v := range tableCache {
+	// 	fmt.Printf("DEBUG: Closing table %s\n", name)
+	// 	if err := v.Close(); err != nil {
+	// 		fmt.Printf("Error closing %s: %v\n", name, err)
+	// 		//return err
+	// 	}
+	// }
 	if conn, ok := w.(net.Conn); ok {
 		return conn.Close()
 	}

@@ -48,10 +48,6 @@ func (bt *BTree) writeNode(node *BNode) error {
 	return bt.pc.MakeDirty(node.PageID)
 }
 
-func (bn *BNode) IsLeaf() bool {
-	return bn.PageType == pager.LEAF
-}
-
 func (bt *BTree) findLeaf(key uint64, breadcrumbs *BTStack) (pager.PageID, error) {
 	currentPageID := bt.pc.GetRootPageID()
 	for {
@@ -304,9 +300,8 @@ func (bt *BTree) RangeScan(startKey, endKey uint64) ([][]byte, error) {
 				data, _ := leaf.GetRecord(i)
 				results = append(results, data)
 			} else if key > endKey {
-				// break out of both loops, we're done
-				leafPageID = 0
-				break
+				bt.pc.UnPin(leafPageID)
+				return results, nil
 			}
 		}
 		bt.pc.UnPin(leaf.PageID)
@@ -616,66 +611,6 @@ func (bt *BTree) Delete(key uint64) error {
 	return bt.writeNode(leaf)
 }
 
-type BNode struct {
-	*pager.SlottedPage
-}
-
-type BreadCrumb struct {
-	PageID pager.PageID
-	Index  int // which child pointer we followed
-}
-
-type BTStack struct {
-	Crumbs []BreadCrumb
-}
-
-func (s *BTStack) Length() int {
-	return len(s.Crumbs)
-}
-
-func (s *BTStack) isEmpty() bool {
-	return len(s.Crumbs) == 0
-}
-
-func (s *BTStack) push(id pager.PageID, idx int) {
-	s.Crumbs = append(s.Crumbs, BreadCrumb{PageID: id, Index: idx})
-}
-
-func (s *BTStack) pop() (BreadCrumb, error) {
-	if s.isEmpty() {
-		return BreadCrumb{}, errors.New("breadcrumb stack empty")
-	}
-	bc := s.Crumbs[len(s.Crumbs)-1]
-	s.Crumbs = s.Crumbs[:len(s.Crumbs)-1]
-	return bc, nil
-}
-
-func (s *BTStack) peek() (BreadCrumb, error) {
-	if s.isEmpty() {
-		return BreadCrumb{}, errors.New("breadcrumb stack empty")
-	}
-	return s.Crumbs[len(s.Crumbs)-1], nil
-}
-
-func (bn *BNode) splitNode(newPageID pager.PageID) (*BNode, uint64, error) {
-	switch bn.PageType {
-	case pager.LEAF:
-		sp, promKey, err := bn.SplitLeaf(newPageID)
-		if err != nil {
-			return nil, 0, err
-		}
-		return &BNode{SlottedPage: sp}, promKey, nil
-	case pager.INTERNAL:
-		sp, promKey, err := bn.SplitInternal(newPageID)
-		if err != nil {
-			return nil, 0, err
-		}
-		return &BNode{SlottedPage: sp}, promKey, nil
-	default:
-		return nil, 0, fmt.Errorf("invalid page type: %v", bn.PageType)
-	}
-}
-
 func (bt *BTree) Stats() string {
 	root, err := bt.loadNode(bt.pc.GetRootPageID())
 	if err != nil {
@@ -688,6 +623,10 @@ func (bt *BTree) Stats() string {
 }
 
 func (bt *BTree) Vacuum() error {
+	return bt.BulkLoad()
+}
+
+func (bt *BTree) oldVacuum() error {
 	// update to bulk loading
 	// update to push file operations into PageCache? Maybe use Vacuum() to build a new tree
 	// then have pc.UpdateTree(bt BTree) actually handle the behind the curtain file swap
@@ -785,4 +724,188 @@ func (bt *BTree) GetSchema() schema.Schema {
 
 func (bt *BTree) Close() error {
 	return bt.pc.Close()
+}
+
+func (bt *BTree) buildLeafLayer() ([]*pager.SlottedPage, error) {
+	// find the left most leaf node to start scan
+	oldLeftLeaf, err := bt.findLeaf(0, &BTStack{})
+	if err != nil {
+		return nil, err
+	}
+
+	// build out a leaf slice and initialize a first page
+	leaves := []*pager.SlottedPage{}
+	newLeafIndex := pager.PageID(1)
+	newLeaf := pager.NewSlottedPage(newLeafIndex, pager.LEAF)
+
+	// follow leaf links to scan left to right
+	currPageID := oldLeftLeaf
+	for currPageID != 0 { // 0 means no sibling to the right, we're done
+		currentLeaf, err := bt.loadNode(currPageID)
+		if err != nil {
+			return nil, err
+		}
+		// iterate over leaf records
+		for i := 0; i < int(currentLeaf.NumSlots); i++ {
+			record, err := currentLeaf.GetRecord(i)
+			if err != nil {
+				return nil, err
+			}
+			// insert record into the newly created leaf node
+			_, err = newLeaf.InsertRecordSorted(record)
+			if err != nil && err.Error() == "page full" {
+				// if the page was full, add it to the return slice, allocate a new leaf node
+				// and insert into that one
+				leaves = append(leaves, newLeaf)
+				newLeafIndex++
+				newLeaf = pager.NewSlottedPage(pager.PageID(newLeafIndex), pager.LEAF)
+				_, err = newLeaf.InsertRecordSorted(record)
+				if err != nil {
+					return nil, err
+				}
+			} else if err != nil {
+				return nil, err
+			}
+		}
+		bt.pc.UnPin(currentLeaf.PageID)
+		// move to next leaf node in original tree
+		currPageID = currentLeaf.NextLeaf
+	}
+
+	// Don't forget the last leaf!
+	if newLeaf.NumSlots > 0 {
+		leaves = append(leaves, newLeaf)
+	}
+
+	// link the leaves
+	for i := 0; i < len(leaves)-1; i++ {
+		leaves[i].NextLeaf = leaves[i+1].PageID
+	}
+	if len(leaves) > 0 {
+		leaves[len(leaves)-1].NextLeaf = 0
+	}
+	return leaves, nil
+}
+
+func buildInternalLayer(children []*pager.SlottedPage) ([]*pager.SlottedPage, error) {
+	if len(children) == 1 {
+		// this is the root node
+		return children, nil
+	}
+	nextPageID := pager.PageID(1)
+	if len(children) > 0 {
+		nextPageID = children[len(children)-1].PageID + 1 // next available page number
+	}
+
+	parents := []*pager.SlottedPage{}
+	currentParent := pager.NewSlottedPage(nextPageID, pager.INTERNAL)
+
+	for i := 0; i < len(children)-1; i++ {
+		separatorKey := children[i+1].GetKey(0) // first key of right child
+		childPageID := children[i].PageID
+
+		record := pager.SerializeInternalRecord(separatorKey, childPageID)
+		_, err := currentParent.InsertRecordSorted(record)
+
+		if err != nil && err.Error() == "page full" {
+			parents = append(parents, currentParent)
+			nextPageID++
+			currentParent = pager.NewSlottedPage(nextPageID, pager.INTERNAL)
+			_, err := currentParent.InsertRecordSorted(record)
+			if err != nil {
+				return nil, err
+			}
+		} else if err != nil {
+			return nil, err
+		}
+	}
+
+	// last child becomes RightmostChild of parent
+	currentParent.RightmostChild = children[len(children)-1].PageID
+	parents = append(parents, currentParent)
+
+	return parents, nil
+}
+
+func (bt *BTree) BulkLoad() error {
+	// phase 1: build leaves
+	leaves, err := bt.buildLeafLayer()
+	if err != nil {
+		return err
+	}
+
+	// Track all pages to write
+	allPages := []*pager.SlottedPage{}
+	allPages = append(allPages, leaves...) // add all the leaves
+
+	// phase 2: build internal layers recursively
+	currentLayer := leaves
+	for len(currentLayer) > 1 {
+		currentLayer, err = buildInternalLayer(currentLayer)
+		if err != nil {
+			return err
+		}
+		allPages = append(allPages, currentLayer...) // add each layer
+	}
+
+	root := currentLayer[0]
+
+	// phase 3: write all pages to the new file and update header
+	tempFile := bt.pc.GetSchema().TableName + ".db.tmp"
+	f, err := os.Create(tempFile)
+	if err != nil {
+		return err
+	}
+
+	// Cleanup temp file on error
+	defer func() {
+		if err != nil {
+			f.Close()
+			os.Remove(tempFile) // Clean up if we return early with error
+		}
+	}()
+
+	tempDM := pager.NewDiskManager(f)
+
+	// create header pointing to root
+	freshHeader := pager.DefaultTableHeader(bt.pc.GetSchema())
+	freshHeader.RootPageID = root.PageID
+	freshHeader.NextPageID = pager.PageID(len(allPages) + 1)
+	freshHeader.NumPages = uint32(len(allPages))
+	tempDM.SetHeader(freshHeader)
+	if err := tempDM.WriteHeader(); err != nil {
+		return err
+	}
+
+	// write all pages
+	for _, page := range allPages {
+		if err := tempDM.WriteSlottedPage(page); err != nil {
+			return err
+		}
+	}
+
+	// sync and close temp file
+	if err := f.Sync(); err != nil {
+		return err
+	}
+	if err := f.Close(); err != nil {
+		return err
+	}
+
+	// close old file, rename, reopen
+	if err := bt.pc.Close(); err != nil {
+		return err
+	}
+
+	origFile := bt.pc.GetSchema().TableName + ".db"
+	if err := os.Rename(tempFile, origFile); err != nil {
+		return err
+	}
+
+	f, err = os.OpenFile(origFile, os.O_RDWR, 0644)
+	if err != nil {
+		return err
+	}
+
+	return bt.pc.UpdateFile(f)
 }

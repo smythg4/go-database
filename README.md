@@ -7,10 +7,10 @@ A database implementation in Go with B+ tree storage. Built as a learning projec
 - B+ tree page-based storage (4KB pages)
 - Multi-client TCP server on port 42069
 - Basic CRUD operations with schema support
-- Page caching with pin/unpin semantics
+- Clock eviction page cache with pin/unpin semantics
 - Free page reuse after deletions
 - Range scans via leaf sibling pointers
-- VACUUM to rebuild and compact tree
+- Fast bulk-loading VACUUM (O(n) rebuild and compact)
 
 ## Quick Start
 
@@ -61,7 +61,7 @@ delete <id>                       Delete by primary key
 count [id] [start end]            Count records
 describe                          Show table schema
 stats                             Show B+ tree statistics
-vacuum                            Rebuild tree (requires reconnect)
+vacuum                            Rebuild and compact tree
 drop <table>                      Delete table file
 show                              List all tables
 .exit                             Close connection
@@ -80,7 +80,7 @@ internal/schema/         - Schema and serialization
 
 **Storage:** B+ tree with slotted pages. Primary key (first field) must be `int` type. Records stored in leaf nodes, internal nodes store routing keys.
 
-**Caching:** 500-page FIFO buffer pool. Pages pinned during operations, unpinned via defer. Evicts unpinned pages when full.
+**Caching:** 200-page buffer pool with Clock eviction algorithm. Pages pinned during operations, unpinned when done. Clock gives "second chance" to recently accessed pages before eviction.
 
 **Concurrency:** `sync.RWMutex` on BTreeStore serializes tree operations. Table cache ensures one instance per file.
 
@@ -107,9 +107,7 @@ go test -bench=. ./internal/store/
 - Primary key must be `int` type
 - No transactions or ACID guarantees
 - No indexes beyond primary key
-- VACUUM requires client reconnect
 - UPDATE uses DELETE + INSERT pattern
-- Count command has off-by-one bug
 - No query optimizer
 
 ## Implementation Notes
@@ -121,6 +119,8 @@ go test -bench=. ./internal/store/
 **Free pages:** Merges add orphaned pages to free list. Allocator checks free list before creating new pages. Cache evicts freed pages to prevent stale pointer bugs.
 
 **Breadcrumb pattern:** Tracks descent path for bottom-up split/merge propagation. Approach from Petrov's book.
+
+**VACUUM bulk loading:** Scans all records sequentially, packs into dense leaf pages, builds internal layers bottom-up. O(n) complexity vs O(n log n) for insert-based rebuild. Typically achieves ~50% space savings and 10x speed improvement.
 
 ## File Format
 

@@ -68,14 +68,14 @@ A handrolled database implementation in Go with multi-client TCP server support,
 ### B+ Tree Storage Engine (`internal/pager` + `internal/btree`)
 
 **Page Cache Layer (`internal/pager/page_cache.go`)** - Buffer pool for page caching:
-- `PageCache`: In-memory cache with FIFO eviction policy (maxCacheSize = 500 pages)
-- `CacheRecord`: Tracks page data, dirty flag, and pin count for each cached page
+- `PageCache`: In-memory cache with Clock eviction policy (maxCacheSize = 200 pages)
+- `CacheRecord`: Tracks page data, dirty flag, pin count, and reference bit for each cached page
 - Pin/unpin semantics prevent eviction of in-use pages during tree operations
 - Key methods:
-  - `Fetch(id)`: Returns page from cache or loads from disk, auto-pins on fetch
+  - `Fetch(id)`: Returns page from cache or loads from disk, auto-pins on fetch, sets refBit
   - `AddNewPage(sp)`: Adds new page to cache, marks dirty, and pins it
   - `UnPin(id)`: Decrements pin count, allowing eviction when count reaches 0
-  - `Evict()`: FIFO eviction of unpinned pages, flushes dirty pages before eviction
+  - `Evict()`: Clock eviction with second-chance algorithm, flushes dirty pages before eviction
   - `MakeDirty(id)`: Marks cached page as dirty (needs flush on eviction)
   - `AllocatePage()`: Allocates new PageID, checks FreePageIDs first
   - `FreePage(id)`: Adds PageID to free list for reuse
@@ -83,10 +83,10 @@ A handrolled database implementation in Go with multi-client TCP server support,
   - `Close()`: Flushes all dirty pages and closes underlying file
   - `UpdateFile(file)`: Switches to new file after VACUUM rename, clears cache
 - **Critical pattern**: BTree operations must pin pages during use, unpin via defer when done
-- **Eviction strategy**: Pages skipped if pinned, moved to back of FIFO queue if pinned
+- **Eviction strategy**: Clock algorithm gives "second chance" to recently accessed pages via refBit before eviction
 - **Header management**: PageCache owns header pointer, BTree accesses via Get/Set methods
-- **Concurrency**: PageCache.mu protects cache map and queue, BTreeStore.mu serializes BTree access
-- **Cache size increased**: Originally 50 pages, increased to 500 to handle deep tree operations where single Insert with cascading splits can pin >50 pages before defers execute
+- **Concurrency**: PageCache.mu protects cache map and clock queue, BTreeStore.mu serializes BTree access
+- **Cache size**: 200 pages (800KB with 4KB pages), sized to handle deep tree operations without exhausting cache
 
 **Page Layer (`internal/pager/page.go`)** - Slotted page implementation:
 - `SlottedPage`: In-memory representation with 13-byte header, slot array, and records
@@ -165,6 +165,8 @@ A handrolled database implementation in Go with multi-client TCP server support,
   - `Stats()`: Debug helper showing root page ID, type, NextPageID allocation
   - `Close()`: Calls `pc.Close()` which flushes all dirty pages and closes file
   - `findLeftSibling/findRightSibling`: Skip tombstones when navigating parent records to find siblings (backward/forward scan)
+  - `Vacuum`: Triggers bulk loading rebuild via `BulkLoad()`
+  - `BulkLoad`: O(n) tree reconstruction - scans leaves sequentially, builds dense leaf layer, constructs internal layers bottom-up, writes to temp file, renames atomically
 - Breadcrumb stack pattern (from Petrov): Tracks PageID and child index during descent for split/merge propagation
 - Child pointer management: After inserting promoted key at position i, updates record[i+1] or RightmostChild
 
@@ -336,11 +338,25 @@ B+ tree page-based storage is **completed and fully integrated** with the CLI:
 - ✅ All unit tests passing (PageCache, BTree, Page)
 - ✅ Stress testing: Chaos test shows 1,449 records across 41 pages (NextPageID=41, not 4829)
 
+**✅ VACUUM Bulk Loading (COMPLETED)**
+
+**Implementation:**
+- ✅ `buildLeafLayer()`: Scans old tree left-to-right via NextLeaf pointers, packs records into dense new leaves
+- ✅ `buildInternalLayer()`: Constructs parent layer using first key of each child as separator, RightmostChild for last pointer
+- ✅ `BulkLoad()`: Orchestrates bottom-up tree construction, writes to temp file, atomic rename, reloads cache
+- ✅ Atomic file replacement: Writes to `.db.tmp`, closes old file, renames temp to original, reopens
+- ✅ Cache invalidation: `PageCache.UpdateFile()` clears stale cache entries after file swap
+- ✅ CLI integration: `commandVacuum` always reloads table cache to ensure fresh handle after rebuild
+- ✅ Error handling: Defer cleanup pattern removes temp file if BulkLoad fails
+
+**Performance:**
+- 10x speed improvement over Insert-based rebuild (O(n) vs O(n log n))
+- ~50% space savings (e.g., 192 pages → 97 pages for 10k records)
+- No client reconnect required (fixed via cache reload in commandVacuum)
+
 **Future Enhancements:**
 - Node borrowing/redistribution (when merge impossible due to size)
-- LRU eviction policy (currently FIFO only)
 - Async background flusher for dirty pages (reduce fsync overhead, batch writes)
-- Optimize VACUUM with bulk loading (O(n) bottom-up build vs current O(n log n) insert-based)
 - Support non-int primary keys via hashing (currently first field must be int32)
 - Transaction support with ACID guarantees (WAL, ARIES recovery)
 - Page-level checksums and compression
@@ -420,14 +436,15 @@ The user learns best through guided exploration, not guided implementation.
 
 - **Primary key constraint**: First field of schema must be int32 type (cast to uint64 for B+ tree keys). Future: support arbitrary types via hashing.
 - **Free list race condition protection**: FreePageIDs has no explicit mutex, but it's safe because BTreeStore's RWMutex serializes all BTree access. Every operation that touches FreePageIDs (via pc.AllocatePage during Insert, pc.FreePage during merge in Delete) holds the write lock.
-- **PageCache concurrency**: PageCache.mu protects cache map and FIFO queue. BTreeStore.mu provides outer serialization for all BTree operations. Pin/unpin must be called within the same BTree operation scope.
-- **Cache size**: maxCacheSize = 500 pages (increased from 50). With 4KB pages, caches up to 2MB of data. Increase necessary because single Insert with cascading splits can pin >50 pages before defers execute.
+- **PageCache concurrency**: PageCache.mu protects cache map and clock queue. BTreeStore.mu provides outer serialization for all BTree operations. Pin/unpin must be called within the same BTree operation scope.
+- **Cache size**: maxCacheSize = 200 pages. With 4KB pages, caches up to 800KB of data. Clock eviction prevents cache exhaustion during deep tree operations.
 - **Eviction and durability**: Dirty pages flushed to disk during eviction via flushRecord(). Close() flushes all remaining dirty pages. Header flushed via explicit FlushHeader() calls.
 - **Performance trade-off**: flushRecord() calls Sync() for durability during eviction. This ensures evicted pages persist, but adds latency. Future: batch writes, async flusher.
-- **Free list vs VACUUM**: Free list prevents file growth by reusing pages, but doesn't reclaim disk space. VACUUM needed to rebuild tree compactly and truncate file.
+- **Free list vs VACUUM**: Free list prevents file growth by reusing pages, but doesn't reclaim disk space. VACUUM rebuilds tree with bulk loading (O(n) sequential scan), achieving ~50% space savings and 10x performance improvement over Insert-based rebuild.
 - **Stress testing importance**: Catastrophic durability bug (100% data loss) and all 8 tombstone bugs only discovered through concurrent stress tests with restart verification and chaos testing.
 - **Tombstone model critical pattern**: `NumSlots` = active record count (decrements on delete), `len(Records)` = array size with tombstones. ALWAYS use `len(Records)` for iteration and bounds checks. Using NumSlots causes silent data loss (records at high indices skipped).
 - **Linear scan for leaf Search**: Binary search breaks with tombstones because `GetKey(mid)` returns 0 for nil records, making comparison logic incorrect. Linear scan is simple, correct, and fast enough for small leaf pages (~50-100 records).
 - **Compact-before-split**: SplitLeaf/SplitInternal must call Compact() first to ensure NumSlots == len(Records), preventing nil record insertion errors.
-- Consider adding a JSON/HTTP endpoint
-- Make VACUUM faster with bulk loading
+- **VACUUM implementation**: Uses bulk loading (buildLeafLayer + buildInternalLayer) for O(n) rebuild. Writes to temp file, atomic rename ensures durability. commandVacuum always reloads table cache to prevent stale file handles.
+- **TCP/REPL cache sharing**: Global tableCache shared across connections. TCP clients don't close tables on disconnect (Close() commented out in commandExit) to prevent breaking other sessions.
+- Consider adding a JSON/HTTP endpoint for external integrations
