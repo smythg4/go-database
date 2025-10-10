@@ -448,3 +448,4 @@ The user learns best through guided exploration, not guided implementation.
 - **VACUUM implementation**: Uses bulk loading (buildLeafLayer + buildInternalLayer) for O(n) rebuild. Writes to temp file, atomic rename ensures durability. commandVacuum always reloads table cache to prevent stale file handles.
 - **TCP/REPL cache sharing**: Global tableCache shared across connections. TCP clients don't close tables on disconnect (Close() commented out in commandExit) to prevent breaking other sessions.
 - Consider adding a JSON/HTTP endpoint for external integrations
+- remember to refactor BulkLoad() to return a []*SlottedPage, then write a pc.ReplaceTreeFromPages(pgs []*SlottedPage) that does the disk io

@@ -72,3 +72,20 @@ func ReadFloat64(r io.Reader) (float64, error) {
 	bits := binary.LittleEndian.Uint64(buf)
 	return math.Float64frombits(bits), nil
 }
+
+func ReadByteSlice(r io.Reader) ([]byte, error) {
+	lenBytes := make([]byte, 4)
+	_, err := io.ReadFull(r, lenBytes)
+	if err != nil {
+		return nil, err
+	}
+	sliceLength := binary.LittleEndian.Uint32(lenBytes)
+
+	bytes := make([]byte, sliceLength)
+	_, err = io.ReadFull(r, bytes)
+	if err != nil {
+		return nil, err
+	}
+
+	return bytes, nil
+}
