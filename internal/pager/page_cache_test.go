@@ -57,7 +57,7 @@ func createTestPageCache(t *testing.T) (*PageCache, *DiskManager, string) {
 
 	pc := NewPageCache(dm, &header)
 
-	return &pc, dm, tmpfile.Name()
+	return pc, dm, tmpfile.Name()
 }
 
 func cleanupTestFile(filename string) {

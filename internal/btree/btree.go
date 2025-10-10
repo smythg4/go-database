@@ -909,3 +909,12 @@ func (bt *BTree) BulkLoad() error {
 
 	return bt.pc.UpdateFile(f)
 }
+
+func (bt *BTree) GetWalMetadata() (rootPageID, nextPageID uint32) {
+	h := bt.pc.GetHeader()
+	return uint32(h.RootPageID), uint32(h.NextPageID)
+}
+
+func (bt *BTree) Checkpoint() error {
+	return bt.pc.FlushAll()
+}

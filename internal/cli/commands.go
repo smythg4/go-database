@@ -136,7 +136,16 @@ func init() {
 			Description: "Systematic compaction and orphan page reaping",
 			Callback:    commandVacuum,
 		},
+		"recover": {
+			Name:        "recover",
+			Description: "Recover database actions from WAL file",
+			Callback:    commandRecover,
+		},
 	}
+}
+
+func commandRecover(config *DatabaseConfig, params []string, w io.Writer) error {
+	return config.TableS.Recover()
 }
 
 func commandVacuum(config *DatabaseConfig, params []string, w io.Writer) error {

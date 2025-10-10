@@ -258,7 +258,7 @@ func (pc *PageCache) flushBatch(ids []PageID) error {
 	return nil
 }
 
-func (pc *PageCache) flushAll() error {
+func (pc *PageCache) FlushAll() error {
 	for _, cr := range pc.cache {
 		if err := pc.writeRecord(cr); err != nil {
 			return err
@@ -311,7 +311,7 @@ func (pc *PageCache) GetSchema() schema.Schema {
 
 func (pc *PageCache) Close() error {
 	// flush everything to the disk first
-	if err := pc.flushAll(); err != nil {
+	if err := pc.FlushAll(); err != nil {
 		return err
 	}
 	return pc.dm.Close()
