@@ -236,6 +236,72 @@ func (bts *BTreeStore) Checkpoint() error {
 	return bts.wal.Truncate()
 }
 
+func (bts *BTreeStore) Commit(txnBuffer []pager.WALRecord) error {
+	// 1. flush WAL
+	if err := bts.wal.FlushWAL(); err != nil {
+		return err
+	}
+
+	// 2. now apply all operations to the tree
+	for _, record := range txnBuffer {
+		switch record.Action {
+		case pager.INSERT:
+			if err := bts.bt.Insert(uint64(record.Key), record.RecordBytes); err != nil {
+				return err
+			}
+		case pager.DELETE:
+			if err := bts.bt.Delete(uint64(record.Key)); err != nil {
+				return err
+			}
+		case pager.CHECKPOINT:
+			if err := bts.bt.Checkpoint(); err != nil {
+				return err
+			}
+		case pager.VACUUM:
+			if err := bts.bt.Vacuum(); err != nil {
+				return err
+			}
+		default:
+			return fmt.Errorf("unsupported action: %v", record.Action)
+		}
+	}
+	return nil
+}
+
+func (bts *BTreeStore) PrepareInsert(record schema.Record) (pager.WALRecord, error) {
+	key, err := bts.bt.ExtractPrimaryKey(record)
+	if err != nil {
+		return pager.WALRecord{}, err
+	}
+
+	data, err := bts.bt.SerializeRecord(record)
+	if err != nil {
+		return pager.WALRecord{}, err
+	}
+
+	if err := bts.wal.LogInsert(key, data); err != nil {
+		return pager.WALRecord{}, err
+	}
+
+	return pager.WALRecord{
+		Action:       pager.INSERT,
+		Key:          pager.WalKey(key),
+		RecordBytes:  data,
+		RecordLength: uint32(len(data)),
+	}, nil
+}
+
+func (bts *BTreeStore) PrepareDelete(key uint64) (pager.WALRecord, error) {
+	if err := bts.wal.LogDelete(key); err != nil {
+		return pager.WALRecord{}, err
+	}
+
+	return pager.WALRecord{
+		Action: pager.DELETE,
+		Key:    pager.WalKey(key),
+	}, nil
+}
+
 func (bts *BTreeStore) LogCheckpoint() error {
 	rpi, npi := bts.bt.GetWalMetadata()
 	if err := bts.wal.LogCheckpoint(rpi, npi); err != nil {

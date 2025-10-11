@@ -11,6 +11,9 @@ A database implementation in Go with B+ tree storage. Built as a learning projec
 - Free page reuse after deletions
 - Range scans via leaf sibling pointers
 - Fast bulk-loading VACUUM (O(n) rebuild and compact)
+- **Write-ahead logging (WAL)** for crash recovery
+- **Transactions** with BEGIN/COMMIT/ABORT (in refinement)
+- Background checkpointing (30s intervals)
 
 ## Quick Start
 
@@ -29,15 +32,20 @@ nc localhost 42069
 
 ```sql
 create users id:int name:string age:int
+begin               -- start transaction
 insert 1 alice 30
 insert 2 bob 25
+commit              -- commit transaction
 select              -- full table scan
 select 1            -- find by id
 select 1 10         -- range scan (ids 1-10)
 count
+begin
 delete 2
+abort               -- rollback transaction (delete not applied)
 stats               -- show tree structure
 vacuum              -- rebuild tree
+recover             -- replay WAL (for crash recovery)
 .exit
 ```
 

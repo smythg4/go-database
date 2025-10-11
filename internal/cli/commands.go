@@ -3,6 +3,7 @@ package cli
 import (
 	"errors"
 	"fmt"
+	"godb/internal/pager"
 	"godb/internal/schema"
 	"godb/internal/store"
 	"io"
@@ -54,6 +55,9 @@ func CreateTable(filename string, sch schema.Schema) (*store.BTreeStore, error) 
 
 type DatabaseConfig struct {
 	TableS *store.BTreeStore
+
+	inTransaction bool
+	txnBuffer     []pager.WALRecord
 }
 
 type CliCommand struct {
@@ -141,7 +145,45 @@ func init() {
 			Description: "Recover database actions from WAL file",
 			Callback:    commandRecover,
 		},
+		"begin": {
+			Name:        "begin",
+			Description: "Initiate a transaction to commit to database",
+			Callback:    commandBegin,
+		},
+		"commit": {
+			Name:        "commit",
+			Description: "Commit a transaction to the database",
+			Callback:    commandCommit,
+		},
+		"abort": {
+			Name:        "abort",
+			Description: "Abort a transaction in process",
+			Callback:    commandAbort,
+		},
 	}
+}
+
+func commandBegin(config *DatabaseConfig, params []string, w io.Writer) error {
+	fmt.Fprintln(w, "Transaction initiated")
+	config.inTransaction = true
+	return nil
+}
+
+func commandAbort(config *DatabaseConfig, params []string, w io.Writer) error {
+	fmt.Fprintln(w, "Transaction aborted")
+	config.inTransaction = false
+	return nil
+}
+
+func commandCommit(config *DatabaseConfig, params []string, w io.Writer) error {
+	fmt.Fprintln(w, "Committing transaction...")
+	if err := config.TableS.Commit(config.txnBuffer); err != nil {
+		return err
+	}
+	fmt.Fprintln(w, "Transaction committed successfully!")
+	config.inTransaction = false
+	config.txnBuffer = []pager.WALRecord{}
+	return nil
 }
 
 func commandRecover(config *DatabaseConfig, params []string, w io.Writer) error {
@@ -355,17 +397,28 @@ func commandDelete(config *DatabaseConfig, params []string, w io.Writer) error {
 		return errors.New("must provide a primary key for deletion")
 	}
 
+	if !config.inTransaction {
+		return errors.New("initiate a transaction with command BEGIN first")
+	}
+
 	key, err := strconv.Atoi(params[0])
 	if err != nil {
 		return fmt.Errorf("error parsing primary key: %v", params[0])
 	}
-	record, err := config.TableS.Find(key)
-	if err != nil {
-		return fmt.Errorf("unable to find key: %d", key)
-	}
 
-	fmt.Fprintf(w, "Deleting %+v from table %s\n", record, config.TableS.Schema().TableName)
-	return config.TableS.Delete(uint64(key))
+	wr, err := config.TableS.PrepareDelete(uint64(key))
+	if err != nil {
+		return err
+	}
+	config.txnBuffer = append(config.txnBuffer, wr)
+	return nil
+	// record, err := config.TableS.Find(key)
+	// if err != nil {
+	// 	return fmt.Errorf("unable to find key: %d", key)
+	// }
+
+	// fmt.Fprintf(w, "Deleting %+v from table %s\n", record, config.TableS.Schema().TableName)
+	// return config.TableS.Delete(uint64(key))
 }
 
 func commandUpdate(config *DatabaseConfig, params []string, w io.Writer) error {
@@ -404,6 +457,11 @@ func commandInsert(config *DatabaseConfig, params []string, w io.Writer) error {
 		return fmt.Errorf("need %d parameters for fields: %v", fieldCount, config.TableS.Schema().GetFieldNames())
 	}
 
+	if !config.inTransaction {
+		return errors.New("initiate a transaction with command BEGIN first")
+	}
+
+	// parse record
 	record := make(schema.Record)
 	for i, field := range config.TableS.Schema().Fields {
 		// parse params[i] according to field.type
@@ -413,8 +471,13 @@ func commandInsert(config *DatabaseConfig, params []string, w io.Writer) error {
 		}
 		record[field.Name] = value
 	}
-	fmt.Fprintf(w, "Inserting %+v into table %s\n", record, config.TableS.Schema().TableName)
-	return config.TableS.Insert(record)
+
+	wr, err := config.TableS.PrepareInsert(record)
+	if err != nil {
+		return err
+	}
+	config.txnBuffer = append(config.txnBuffer, wr)
+	return nil
 }
 
 func selectAll(config *DatabaseConfig, w io.Writer) error {

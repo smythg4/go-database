@@ -354,16 +354,107 @@ B+ tree page-based storage is **completed and fully integrated** with the CLI:
 - ~50% space savings (e.g., 192 pages → 97 pages for 10k records)
 - No client reconnect required (fixed via cache reload in commandVacuum)
 
+**✅ WAL & Transactions (IN PROGRESS - NEEDS REFINEMENT)**
+
+**What's Working:**
+- ✅ WAL record format: INSERT, DELETE, UPDATE, CHECKPOINT, VACUUM with proper serialization
+- ✅ LSN as byte offset in WAL file (seekable, monotonic)
+- ✅ WAL Manager: `NewWalManager()`, `ReadAll()`, `FlushWAL()`, `Truncate()`
+- ✅ Round-trip tested: All 5 record types serialize/deserialize correctly
+- ✅ Recovery mechanism: `Recover()` replays WAL operations to restore database state
+- ✅ Background checkpointing: 30-second ticker flushes dirty pages, logs checkpoint, truncates WAL
+- ✅ Transaction commands: BEGIN, COMMIT, ABORT in CLI
+- ✅ Per-session transaction state: `inTransaction` and `txnBuffer` in DatabaseConfig
+- ✅ Atomicity demonstrated: Multiple INSERTs buffered, all applied on COMMIT, none applied on ABORT
+
+**Critical Issues to Fix (NEXT SESSION):**
+
+1. **Auto-commit broken**: INSERT/DELETE now REQUIRE BEGIN/COMMIT. Lost convenience of simple operations.
+   - Need: Support both auto-commit (INSERT without BEGIN) and explicit transactions (BEGIN...COMMIT)
+
+2. **Redundant buffering**: `PrepareInsert/PrepareDelete` call `LogInsert/LogDelete` → adds to `wal.buffer`
+   - ALSO stores in `config.txnBuffer` → operations duplicated in two places
+   - Fix: Only log to WAL on COMMIT, not during Prepare
+
+3. **WAL buffer contamination**: Multiple sessions share same `wal.buffer`
+   - If User A buffers ops, User B commits → User A's uncommitted ops get flushed
+   - Fix: Either per-session WAL buffers, or only use `config.txnBuffer` and flush on COMMIT
+
+4. **No read isolation**: Uncommitted writes from other sessions might be visible during SELECT
+   - Need: Define isolation level (READ COMMITTED? SNAPSHOT ISOLATION?)
+
+5. **Checkpoint during transaction**: Background checkpoint could fire mid-transaction
+   - Risk: Partial transaction state gets checkpointed
+   - Fix: Checkpoint should skip if any active transactions, or wait for them
+
+**Architecture Decision Needed:**
+
+**Where should transaction buffering happen?**
+- **Option A**: Session-level only (`config.txnBuffer`)
+  - PrepareInsert/PrepareDelete create WALRecord, return it
+  - DON'T call LogInsert/LogDelete (don't touch wal.buffer)
+  - On COMMIT: Loop through txnBuffer, call LogInsert/LogDelete, then FlushWAL
+  - Simple, clean separation
+
+- **Option B**: WAL Manager with transaction IDs
+  - WALManager tracks multiple transaction buffers (map[txnID][]WALRecord)
+  - More complex, but needed for advanced isolation
+
+**Recommend Option A for now** - simpler, gets transactions working correctly.
+
+**Implementation Plan (Next Session):**
+1. Remove LogInsert/LogDelete calls from PrepareInsert/PrepareDelete
+2. On COMMIT: for each record in txnBuffer, call LogInsert/LogDelete, then FlushWAL once
+3. Restore auto-commit: if !inTransaction in commandInsert/Delete, call BTreeStore.Insert/Delete directly
+4. Test: Verify auto-commit works, transactions work, no cross-contamination
+5. Address checkpoint timing (pause during active transactions)
+
 **Future Enhancements:**
 - Node borrowing/redistribution (when merge impossible due to size)
 - Async background flusher for dirty pages (reduce fsync overhead, batch writes)
 - Support non-int primary keys via hashing (currently first field must be int32)
-- Transaction support with ACID guarantees (WAL, ARIES recovery)
+- Group commit optimization (batch multiple transactions, single fsync)
+- MVCC for snapshot isolation
 - Page-level checksums and compression
 
 ## Learning-Focused Interaction Guidelines
 
 **CRITICAL: This is a learning project. The user's goal is deep understanding, not quick completion.**
+
+### Scott Young's "Get Better at Anything" Principles
+
+The user follows principles from Scott Young's learning framework. Apply these when helping:
+
+**1. See (Observe the skill)**
+- Show concrete examples from working code
+- Point to specific implementations: "Look at how `PageCache.Evict()` handles the clock hand"
+- Use analogies to connect to known concepts (Rust, other systems)
+- Explain "why" decisions were made, not just "what" was implemented
+
+**2. Do (Practice with feedback)**
+- Let user implement first, then provide feedback
+- Encourage experimentation: "Try it and see what breaks"
+- Guide discovery of bugs through testing rather than preemptive fixes
+- Validate attempts even if imperfect: "Good start! Now consider edge case X..."
+
+**3. Feedback (Immediate, specific correction)**
+- When code has issues, explain WHY it's wrong and WHAT breaks
+- Show consequences: "This causes data loss because..."
+- Offer specific fixes, not vague suggestions
+- Connect errors to concepts: "This is the defer-in-loop bug we saw earlier"
+
+**4. Retention (Spaced practice, retrieval)**
+- Reference previous implementations: "Like you did with page splits..."
+- Ask recall questions: "How did you handle this in PageCache?"
+- Build on foundations iteratively (don't rebuild from scratch)
+- Create connections between concepts (WAL durability ← fsync ← page writes)
+
+**Learning Velocity Observations:**
+- User built B+ tree + WAL + transactions in 11 days
+- High learning velocity when in flow state
+- Prefers focused 2-4 hour sessions over extended marathons
+- Book → project → book cycle works well (Petrov → database → Bodner Context chapter)
+- Stress testing reveals deep bugs (tombstone bugs, durability issues) - always recommend testing
 
 ### What Works Well (User's Preferred Approach)
 
@@ -447,5 +538,9 @@ The user learns best through guided exploration, not guided implementation.
 - **Compact-before-split**: SplitLeaf/SplitInternal must call Compact() first to ensure NumSlots == len(Records), preventing nil record insertion errors.
 - **VACUUM implementation**: Uses bulk loading (buildLeafLayer + buildInternalLayer) for O(n) rebuild. Writes to temp file, atomic rename ensures durability. commandVacuum always reloads table cache to prevent stale file handles.
 - **TCP/REPL cache sharing**: Global tableCache shared across connections. TCP clients don't close tables on disconnect (Close() commented out in commandExit) to prevent breaking other sessions.
+- **WAL transaction state (IN PROGRESS)**: Currently transactions REQUIRE BEGIN/COMMIT - auto-commit is broken. PrepareInsert/PrepareDelete call LogInsert/LogDelete creating redundant buffering. Fix needed: session-level buffering only, log to WAL on COMMIT.
+- **Transaction isolation**: Per-session transaction state in DatabaseConfig (inTransaction, txnBuffer). Multiple users can build transactions concurrently, BTreeStore.mu serializes COMMIT execution. Currently no read isolation - uncommitted writes might be visible.
+- **Background checkpointing**: 30-second ticker in BTreeStore.startCheckpointer(). Flushes all dirty pages, logs CHECKPOINT, truncates WAL. ISSUE: Can fire during active transactions - needs fix to skip or wait.
+- **WAL file format**: LSN as byte offset (seekable), records: [LSN:8][Action:1][...fields]. Recovery: ReadAll() → replay Insert/Delete operations. Checkpoint truncates entire WAL (clean slate).
 - Consider adding a JSON/HTTP endpoint for external integrations
-- remember to refactor BulkLoad() to return a []*SlottedPage, then write a pc.ReplaceTreeFromPages(pgs []*SlottedPage) that does the disk io
+- Remember to refactor BulkLoad() to return a []*SlottedPage, then write a pc.ReplaceTreeFromPages(pgs []*SlottedPage) that does the disk io
