@@ -1,16 +1,23 @@
 package pager
 
 import (
+	"context"
 	"encoding/binary"
 	"fmt"
 	"godb/internal/encoding"
 	"io"
 	"os"
+	"sync"
 )
 
+type WALRequest struct {
+	Records []WALRecord
+	Done    chan error
+}
+
 type WALManager struct {
-	file   *os.File
-	buffer []WALRecord
+	file        *os.File
+	RequestChan chan WALRequest
 }
 
 type LSN uint64
@@ -37,16 +44,61 @@ type WALRecord struct {
 	NextPageID   uint32
 }
 
-func NewWalManager(filename string) (*WALManager, error) {
+func NewWalManager(filename string, ctx context.Context, wg *sync.WaitGroup) (*WALManager, error) {
 	f, err := os.OpenFile(filename, os.O_RDWR|os.O_CREATE|os.O_APPEND, 0644)
 	if err != nil {
 		return nil, err
 	}
 
-	return &WALManager{
-		file:   f,
-		buffer: []WALRecord{},
-	}, nil
+	wm := &WALManager{
+		file:        f,
+		RequestChan: make(chan WALRequest, 100),
+	}
+
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for {
+			select {
+			case <-ctx.Done():
+				// context cancelled, drain remaining requets then exit
+				close(wm.RequestChan)
+				for req := range wm.RequestChan {
+					req.Done <- fmt.Errorf("WAL writer shutting down")
+				}
+				return
+			case req, ok := <-wm.RequestChan:
+				if !ok {
+					return // channel closed
+				}
+				// write all records in the request
+				err := wm.writeRecords(req.Records)
+				req.Done <- err
+			}
+		}
+	}()
+	return wm, nil
+}
+
+func (wm *WALManager) writeRecords(records []WALRecord) error {
+	for i := range records {
+		fileOffset, err := wm.getCurrentOffset()
+		if err != nil {
+			return err
+		}
+
+		records[i].Lsn = LSN(fileOffset)
+		data, err := records[i].Serialize()
+		if err != nil {
+			return err
+		}
+
+		_, err = wm.file.Write(data)
+		if err != nil {
+			return err
+		}
+	}
+	return wm.file.Sync()
 }
 
 func (wm *WALManager) ReadAll() ([]WALRecord, error) {
@@ -267,8 +319,15 @@ func (w *WALManager) LogInsert(key uint64, record []byte) error {
 		RecordLength: uint32(len(record)),
 		RecordBytes:  record,
 	}
-	w.buffer = append(w.buffer, wr)
-	return nil
+
+	done := make(chan error, 1)
+
+	w.RequestChan <- WALRequest{
+		Records: []WALRecord{wr},
+		Done:    done,
+	}
+	// block until writer responds
+	return <-done
 }
 
 func (w *WALManager) LogDelete(key uint64) error {
@@ -278,8 +337,14 @@ func (w *WALManager) LogDelete(key uint64) error {
 		Action: DELETE,
 		Key:    WalKey(key),
 	}
-	w.buffer = append(w.buffer, wr)
-	return nil
+
+	done := make(chan error, 1)
+
+	w.RequestChan <- WALRequest{
+		Records: []WALRecord{wr},
+		Done:    done,
+	}
+	return <-done
 }
 
 func (w *WALManager) LogUpdate(key uint64, record []byte) error {
@@ -291,8 +356,14 @@ func (w *WALManager) LogUpdate(key uint64, record []byte) error {
 		RecordLength: uint32(len(record)),
 		RecordBytes:  record,
 	}
-	w.buffer = append(w.buffer, wr)
-	return nil
+
+	done := make(chan error, 1)
+
+	w.RequestChan <- WALRequest{
+		Records: []WALRecord{wr},
+		Done:    done,
+	}
+	return <-done
 }
 
 func (w *WALManager) LogCheckpoint(rootPageID, nextPageID uint32) error {
@@ -303,8 +374,14 @@ func (w *WALManager) LogCheckpoint(rootPageID, nextPageID uint32) error {
 		RootPageID: rootPageID,
 		NextPageID: nextPageID,
 	}
-	w.buffer = append(w.buffer, wr)
-	return nil
+
+	done := make(chan error, 1)
+
+	w.RequestChan <- WALRequest{
+		Records: []WALRecord{wr},
+		Done:    done,
+	}
+	return <-done
 }
 
 func (w *WALManager) LogVacuum(rootPageID, nextPageID uint32) error {
@@ -315,8 +392,14 @@ func (w *WALManager) LogVacuum(rootPageID, nextPageID uint32) error {
 		RootPageID: rootPageID,
 		NextPageID: nextPageID,
 	}
-	w.buffer = append(w.buffer, wr)
-	return nil
+
+	done := make(chan error, 1)
+
+	w.RequestChan <- WALRequest{
+		Records: []WALRecord{wr},
+		Done:    done,
+	}
+	return <-done
 }
 
 func (w *WALManager) getCurrentOffset() (uint64, error) {
@@ -325,26 +408,6 @@ func (w *WALManager) getCurrentOffset() (uint64, error) {
 		return 0, err
 	}
 	return uint64(info.Size()), nil
-}
-
-func (w *WALManager) FlushWAL() error {
-	for i := range w.buffer {
-		fileOffset, err := w.getCurrentOffset()
-		if err != nil {
-			return err
-		}
-		w.buffer[i].Lsn = LSN(fileOffset)
-		data, err := w.buffer[i].Serialize()
-		if err != nil {
-			return err
-		}
-		_, err = w.file.Write(data)
-		if err != nil {
-			return err
-		}
-	}
-	w.buffer = []WALRecord{}
-	return w.file.Sync()
 }
 
 func (w *WALManager) Truncate() error {

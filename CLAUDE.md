@@ -417,6 +417,27 @@ B+ tree page-based storage is **completed and fully integrated** with the CLI:
 - MVCC for snapshot isolation
 - Page-level checksums and compression
 
+## Current Todo List
+
+**Transaction Fixes (Priority 1):**
+1. Remove LogInsert call from PrepareInsert in btree_store.go:282-284
+2. Remove LogDelete call from PrepareDelete in btree_store.go:295-297
+3. Update Commit() to log operations before applying them
+4. Update commandInsert to check inTransaction flag (auto-commit vs buffer)
+5. Update commandDelete to check inTransaction flag (auto-commit vs buffer)
+6. Test auto-commit mode (INSERT without BEGIN should commit immediately)
+7. Test explicit transaction mode (BEGIN, multiple ops, COMMIT)
+8. Test ABORT rollback (BEGIN, ops, ABORT should discard buffered ops)
+
+**Graceful Shutdown & Context (Priority 2):**
+9. Add graceful shutdown with context.Context and sync.WaitGroup
+10. Add on-demand checkpoint triggering via channel request/response
+11. Add signal handling in main.go for Ctrl+C graceful shutdown
+
+**Reading:** "Concurrency in Go" by Katherine Cox-Buday (ordered, arriving soon)
+
+**Next 30 Days Focus:** Go wizard path - complete transactions, add context/channels, profile & optimize, apply Cox-Buday patterns
+
 ## Learning-Focused Interaction Guidelines
 
 **CRITICAL: This is a learning project. The user's goal is deep understanding, not quick completion.**

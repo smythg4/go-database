@@ -11,9 +11,11 @@ A database implementation in Go with B+ tree storage. Built as a learning projec
 - Free page reuse after deletions
 - Range scans via leaf sibling pointers
 - Fast bulk-loading VACUUM (O(n) rebuild and compact)
-- **Write-ahead logging (WAL)** for crash recovery
-- **Transactions** with BEGIN/COMMIT/ABORT (in refinement)
-- Background checkpointing (30s intervals)
+- **Write-ahead logging (WAL)** with channel-based writer
+- **ACID transactions** with BEGIN/COMMIT/ABORT
+- Auto-commit mode for single operations
+- Background checkpointing (30s intervals) with graceful shutdown
+- Context-based cancellation and coordinated cleanup
 
 ## Quick Start
 
@@ -62,6 +64,9 @@ recover             -- replay WAL (for crash recovery)
 ```
 create <table> <field:type> ...   Create table (first field is primary key)
 use <table>                       Switch to table
+begin                             Start transaction
+commit                            Commit transaction
+abort                             Rollback transaction
 insert <val1> <val2> ...          Insert record
 select [id] [start end]           Query records
 update <val1> <val2> ...          Update record (delete + insert)
@@ -70,19 +75,20 @@ count [id] [start end]            Count records
 describe                          Show table schema
 stats                             Show B+ tree statistics
 vacuum                            Rebuild and compact tree
+recover                           Replay WAL (manual recovery)
 drop <table>                      Delete table file
 show                              List all tables
-.exit                             Close connection
+.exit                             Close connection (triggers checkpoint)
 ```
 
 ## Architecture
 
 ```
-cmd/main.go              - TCP server + REPL
-internal/cli/            - Command parsing
-internal/store/          - BTreeStore wrapper
+cmd/main.go              - TCP server + REPL with graceful shutdown
+internal/cli/            - Command parsing and transaction state
+internal/store/          - BTreeStore wrapper with transaction support
 internal/btree/          - B+ tree implementation
-internal/pager/          - Page cache, disk I/O, slotted pages
+internal/pager/          - Page cache, disk I/O, slotted pages, WAL manager
 internal/schema/         - Schema and serialization
 ```
 
@@ -90,9 +96,11 @@ internal/schema/         - Schema and serialization
 
 **Caching:** 200-page buffer pool with Clock eviction algorithm. Pages pinned during operations, unpinned when done. Clock gives "second chance" to recently accessed pages before eviction.
 
-**Concurrency:** `sync.RWMutex` on BTreeStore serializes tree operations. Table cache ensures one instance per file.
+**Concurrency:** `sync.RWMutex` on BTreeStore serializes tree operations. Single WAL writer goroutine handles all write requests via channels (request/response pattern). Table cache ensures one instance per file.
 
-**Durability:** Page writes call `Sync()` during eviction. Header flushed after insert/delete operations.
+**Transactions:** Auto-commit for single operations (INSERT/DELETE/UPDATE). Explicit transactions buffer operations and batch WAL writes on COMMIT. ABORT discards buffered operations. Each transaction sends all records in one WAL request for optimal performance.
+
+**Durability:** Page writes call `Sync()` during eviction. WAL writer syncs after every flush. Checkpoint on graceful shutdown ensures clean state. Header flushed after insert/delete operations.
 
 ## Testing
 
@@ -113,10 +121,12 @@ go test -bench=. ./internal/store/
 ## Known Limitations
 
 - Primary key must be `int` type
-- No transactions or ACID guarantees
+- Single-level atomicity (no nested transactions or savepoints)
+- No isolation levels (writes serialized by BTreeStore mutex)
 - No indexes beyond primary key
-- UPDATE uses DELETE + INSERT pattern
+- UPDATE uses DELETE + INSERT pattern (not in-place)
 - No query optimizer
+- REPL doesn't respect context cancellation (prompt persists on Ctrl+C until Enter pressed)
 
 ## Implementation Notes
 
@@ -136,6 +146,11 @@ Tables stored as `.db` files:
 - Page 0: Header (magic, version, root page ID, schema, free list)
 - Page 1+: Slotted pages (leaf or internal nodes)
 - 4KB pages with binary serialization (LittleEndian)
+
+WAL stored as `.wal` files:
+- LSN (8 bytes) + Action (1 byte) + record-specific fields
+- Actions: INSERT, DELETE, UPDATE, CHECKPOINT, VACUUM
+- Truncated on checkpoint, replayed on recovery
 
 ## Development
 

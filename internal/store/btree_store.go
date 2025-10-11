@@ -1,6 +1,7 @@
 package store
 
 import (
+	"context"
 	"fmt"
 	"godb/internal/btree"
 	"godb/internal/pager"
@@ -16,17 +17,21 @@ import (
 type BTreeStore struct {
 	bt  *btree.BTree
 	wal *pager.WALManager
-	mu  sync.RWMutex
+
+	wg  *sync.WaitGroup
+	ctx context.Context
+
+	mu sync.RWMutex
 }
 
-func NewBTreeStore(filename string) (*BTreeStore, error) {
+func NewBTreeStore(filename string, ctx context.Context, wg *sync.WaitGroup) (*BTreeStore, error) {
 	file, err := os.OpenFile(filename, os.O_RDWR|os.O_CREATE, 0644)
 	if err != nil {
 		return nil, err
 	}
 
 	walFileName := strings.TrimSuffix(filename, ".db") + ".wal"
-	wm, err := pager.NewWalManager(walFileName)
+	wm, err := pager.NewWalManager(walFileName, ctx, wg)
 	if err != nil {
 		return nil, err
 	}
@@ -56,19 +61,20 @@ func NewBTreeStore(filename string) (*BTreeStore, error) {
 
 	header := dm.GetHeader()
 	bt := btree.NewBTree(dm, header)
-	bts := &BTreeStore{bt: bt, wal: wm}
-	bts.startCheckpointer()
+	bts := &BTreeStore{bt: bt, wal: wm, ctx: ctx, wg: wg}
+	wg.Add(1)
+	go bts.startCheckpointer()
 	return bts, nil
 }
 
-func CreateBTreeStore(filename string, sch schema.Schema) (*BTreeStore, error) {
+func CreateBTreeStore(filename string, sch schema.Schema, ctx context.Context, wg *sync.WaitGroup) (*BTreeStore, error) {
 	file, err := os.OpenFile(filename, os.O_RDWR|os.O_CREATE, 0644)
 	if err != nil {
 		return nil, err
 	}
 
 	walFileName := strings.TrimSuffix(filename, ".db") + ".wal"
-	wm, err := pager.NewWalManager(walFileName)
+	wm, err := pager.NewWalManager(walFileName, ctx, wg)
 	if err != nil {
 		return nil, err
 	}
@@ -88,23 +94,31 @@ func CreateBTreeStore(filename string, sch schema.Schema) (*BTreeStore, error) {
 
 	header := dm.GetHeader()
 	bt := btree.NewBTree(dm, header)
-	bts := &BTreeStore{bt: bt, wal: wm}
-	bts.startCheckpointer()
+	bts := &BTreeStore{bt: bt, wal: wm, ctx: ctx, wg: wg}
+	wg.Add(1)
+	go bts.startCheckpointer()
 	return bts, nil
 }
 
 func (bts *BTreeStore) startCheckpointer() {
-	go func() {
-		ticker := time.NewTicker(30 * time.Second)
-		defer ticker.Stop()
-
-		for range ticker.C {
+	defer bts.wg.Done()
+	ticker := time.NewTicker(30 * time.Second)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ticker.C:
 			if err := bts.Checkpoint(); err != nil {
 				log.Printf("Backgound checkpoint failed: %v", err)
 			}
 			fmt.Printf("DEBUG: checkpoint hit at %v\n", time.Now().UTC())
+		case <-bts.ctx.Done():
+			if err := bts.Checkpoint(); err != nil {
+				log.Printf("Backgound checkpoint failed: %v", err)
+			}
+			fmt.Printf("DEBUG: checkpoint hit at %v\n", time.Now().UTC())
+			return
 		}
-	}()
+	}
 }
 
 func (bts *BTreeStore) Insert(record schema.Record) error {
@@ -237,12 +251,17 @@ func (bts *BTreeStore) Checkpoint() error {
 }
 
 func (bts *BTreeStore) Commit(txnBuffer []pager.WALRecord) error {
-	// 1. flush WAL
-	if err := bts.wal.FlushWAL(); err != nil {
+	// 1. Log actions
+	done := make(chan error, 1)
+	bts.wal.RequestChan <- pager.WALRequest{
+		Records: txnBuffer,
+		Done:    done,
+	}
+	if err := <-done; err != nil {
 		return err
 	}
 
-	// 2. now apply all operations to the tree
+	// 3. now apply all operations to the tree
 	for _, record := range txnBuffer {
 		switch record.Action {
 		case pager.INSERT:
@@ -279,10 +298,6 @@ func (bts *BTreeStore) PrepareInsert(record schema.Record) (pager.WALRecord, err
 		return pager.WALRecord{}, err
 	}
 
-	if err := bts.wal.LogInsert(key, data); err != nil {
-		return pager.WALRecord{}, err
-	}
-
 	return pager.WALRecord{
 		Action:       pager.INSERT,
 		Key:          pager.WalKey(key),
@@ -292,9 +307,6 @@ func (bts *BTreeStore) PrepareInsert(record schema.Record) (pager.WALRecord, err
 }
 
 func (bts *BTreeStore) PrepareDelete(key uint64) (pager.WALRecord, error) {
-	if err := bts.wal.LogDelete(key); err != nil {
-		return pager.WALRecord{}, err
-	}
 
 	return pager.WALRecord{
 		Action: pager.DELETE,
@@ -307,7 +319,7 @@ func (bts *BTreeStore) LogCheckpoint() error {
 	if err := bts.wal.LogCheckpoint(rpi, npi); err != nil {
 		return err
 	}
-	return bts.wal.FlushWAL()
+	return nil
 }
 
 func (bts *BTreeStore) LogVacuum() error {
@@ -315,26 +327,26 @@ func (bts *BTreeStore) LogVacuum() error {
 	if err := bts.wal.LogVacuum(rpi, npi); err != nil {
 		return err
 	}
-	return bts.wal.FlushWAL()
+	return nil
 }
 
 func (bts *BTreeStore) LogInsert(key uint64, recordBytes []byte) error {
 	if err := bts.wal.LogInsert(key, recordBytes); err != nil {
 		return err
 	}
-	return bts.wal.FlushWAL()
+	return nil
 }
 
 func (bts *BTreeStore) LogDelete(key uint64) error {
 	if err := bts.wal.LogDelete(key); err != nil {
 		return err
 	}
-	return bts.wal.FlushWAL()
+	return nil
 }
 
 func (bts *BTreeStore) LogUpdate(key uint64, recordBytes []byte) error {
 	if err := bts.wal.LogUpdate(key, recordBytes); err != nil {
 		return err
 	}
-	return bts.wal.FlushWAL()
+	return nil
 }

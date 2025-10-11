@@ -1,12 +1,14 @@
 package cli
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"godb/internal/pager"
 	"godb/internal/schema"
 	"godb/internal/store"
 	"io"
+	"log"
 	"math"
 	"net"
 	"os"
@@ -20,7 +22,7 @@ var (
 	tableCache   = make(map[string]*store.BTreeStore)
 )
 
-func GetOrOpenTable(filename string) (*store.BTreeStore, error) {
+func GetOrOpenTable(filename string, ctx context.Context, wg *sync.WaitGroup) (*store.BTreeStore, error) {
 	tableCacheMu.Lock()
 	defer tableCacheMu.Unlock()
 
@@ -28,7 +30,7 @@ func GetOrOpenTable(filename string) (*store.BTreeStore, error) {
 		return bts, nil
 	}
 
-	bts, err := store.NewBTreeStore(filename)
+	bts, err := store.NewBTreeStore(filename, ctx, wg)
 	if err != nil {
 		return nil, err
 	}
@@ -36,7 +38,7 @@ func GetOrOpenTable(filename string) (*store.BTreeStore, error) {
 	return bts, nil
 }
 
-func CreateTable(filename string, sch schema.Schema) (*store.BTreeStore, error) {
+func CreateTable(filename string, sch schema.Schema, ctx context.Context, wg *sync.WaitGroup) (*store.BTreeStore, error) {
 	tableCacheMu.Lock()
 	defer tableCacheMu.Unlock()
 
@@ -44,7 +46,7 @@ func CreateTable(filename string, sch schema.Schema) (*store.BTreeStore, error) 
 		return nil, fmt.Errorf("table already open: %s", filename)
 	}
 
-	ts, err := store.CreateBTreeStore(filename, sch)
+	ts, err := store.CreateBTreeStore(filename, sch, ctx, wg)
 	if err != nil {
 		return nil, err
 	}
@@ -58,6 +60,25 @@ type DatabaseConfig struct {
 
 	inTransaction bool
 	txnBuffer     []pager.WALRecord
+
+	ctx context.Context
+	wg  *sync.WaitGroup
+}
+
+func NewDatabaseConfig(bts *store.BTreeStore, ctx context.Context, wg *sync.WaitGroup) *DatabaseConfig {
+	return &DatabaseConfig{
+		TableS: bts,
+		ctx:    ctx,
+		wg:     wg,
+	}
+}
+
+func (dbc *DatabaseConfig) Clone() *DatabaseConfig {
+	return &DatabaseConfig{
+		TableS: dbc.TableS,
+		ctx:    dbc.ctx,
+		wg:     dbc.wg,
+	}
 }
 
 type CliCommand struct {
@@ -171,6 +192,7 @@ func commandBegin(config *DatabaseConfig, params []string, w io.Writer) error {
 
 func commandAbort(config *DatabaseConfig, params []string, w io.Writer) error {
 	fmt.Fprintln(w, "Transaction aborted")
+	config.txnBuffer = []pager.WALRecord{}
 	config.inTransaction = false
 	return nil
 }
@@ -204,7 +226,7 @@ func commandVacuum(config *DatabaseConfig, params []string, w io.Writer) error {
 	tableCacheMu.Unlock()
 
 	// Reload the table fresh from disk
-	freshTable, reloadErr := GetOrOpenTable(fName)
+	freshTable, reloadErr := GetOrOpenTable(fName, config.ctx, config.wg)
 	if reloadErr != nil {
 		return fmt.Errorf("failed to reload after vacuum: %v", reloadErr)
 	}
@@ -314,7 +336,7 @@ func commandCreate(config *DatabaseConfig, params []string, w io.Writer) error {
 		Fields:    fields,
 	}
 
-	newTableStore, err := store.CreateBTreeStore(fName, sch)
+	newTableStore, err := store.CreateBTreeStore(fName, sch, config.ctx, config.wg)
 	if err != nil {
 		return err
 	}
@@ -330,7 +352,7 @@ func commandUse(config *DatabaseConfig, params []string, w io.Writer) error {
 
 	tName := params[0]
 
-	ts, err := GetOrOpenTable(tName + ".db")
+	ts, err := GetOrOpenTable(tName+".db", config.ctx, config.wg)
 	if err != nil {
 		return err
 	}
@@ -383,6 +405,9 @@ func commandExit(config *DatabaseConfig, params []string, w io.Writer) error {
 	// for local clients, close the entire db
 	defer os.Exit(0)
 	for _, v := range tableCache {
+		if err := v.Checkpoint(); err != nil {
+			log.Printf("Checkpoint failed on exit: %v\n", err)
+		}
 		err := v.Close()
 		if err != nil {
 			return err
@@ -397,28 +422,28 @@ func commandDelete(config *DatabaseConfig, params []string, w io.Writer) error {
 		return errors.New("must provide a primary key for deletion")
 	}
 
-	if !config.inTransaction {
-		return errors.New("initiate a transaction with command BEGIN first")
-	}
-
 	key, err := strconv.Atoi(params[0])
 	if err != nil {
 		return fmt.Errorf("error parsing primary key: %v", params[0])
 	}
 
-	wr, err := config.TableS.PrepareDelete(uint64(key))
-	if err != nil {
-		return err
-	}
-	config.txnBuffer = append(config.txnBuffer, wr)
-	return nil
-	// record, err := config.TableS.Find(key)
-	// if err != nil {
-	// 	return fmt.Errorf("unable to find key: %d", key)
-	// }
+	if config.inTransaction {
+		wr, err := config.TableS.PrepareDelete(uint64(key))
+		if err != nil {
+			return err
+		}
+		config.txnBuffer = append(config.txnBuffer, wr)
+		return nil
+	} else {
+		record, err := config.TableS.Find(key)
+		if err != nil {
+			return fmt.Errorf("unable to find key: %d", key)
+		}
 
-	// fmt.Fprintf(w, "Deleting %+v from table %s\n", record, config.TableS.Schema().TableName)
-	// return config.TableS.Delete(uint64(key))
+		fmt.Fprintf(w, "Deleting %+v from table %s\n", record, config.TableS.Schema().TableName)
+		return config.TableS.Delete(uint64(key))
+	}
+
 }
 
 func commandUpdate(config *DatabaseConfig, params []string, w io.Writer) error {
@@ -428,37 +453,6 @@ func commandUpdate(config *DatabaseConfig, params []string, w io.Writer) error {
 
 	if len(params) != fieldCount {
 		return fmt.Errorf("need %d parameters for fields: %v", fieldCount, config.TableS.Schema().GetFieldNames())
-	}
-
-	record := make(schema.Record)
-	for i, field := range config.TableS.Schema().Fields {
-		// parse params[i] according to field.type
-		value, err := schema.ParseValue(params[i], field.Type)
-		if err != nil {
-			return fmt.Errorf("invalid value for %s: %v", field.Name, err)
-		}
-		record[field.Name] = value
-	}
-	fmt.Fprintf(w, "Updating %+v in table %s\n", record, config.TableS.Schema().TableName)
-	firstField := config.TableS.Schema().Fields[0].Name
-	key := record[firstField].(int32)
-	err := config.TableS.Delete(uint64(key))
-	if err != nil {
-		return err
-	}
-	return config.TableS.Insert(record)
-}
-
-func commandInsert(config *DatabaseConfig, params []string, w io.Writer) error {
-
-	fieldCount := len(config.TableS.Schema().Fields)
-
-	if len(params) != fieldCount {
-		return fmt.Errorf("need %d parameters for fields: %v", fieldCount, config.TableS.Schema().GetFieldNames())
-	}
-
-	if !config.inTransaction {
-		return errors.New("initiate a transaction with command BEGIN first")
 	}
 
 	// parse record
@@ -471,12 +465,62 @@ func commandInsert(config *DatabaseConfig, params []string, w io.Writer) error {
 		}
 		record[field.Name] = value
 	}
+	firstField := config.TableS.Schema().Fields[0].Name
+	key := record[firstField].(int32)
 
-	wr, err := config.TableS.PrepareInsert(record)
-	if err != nil {
-		return err
+	if config.inTransaction {
+		wr, err := config.TableS.PrepareInsert(record)
+		if err != nil {
+			return err
+		}
+		config.txnBuffer = append(config.txnBuffer, wr)
+		wr, err = config.TableS.PrepareDelete(uint64(key))
+		if err != nil {
+			return err
+		}
+		config.txnBuffer = append(config.txnBuffer, wr)
+		return nil
+	} else {
+		fmt.Fprintf(w, "Updating %+v in table %s\n", record, config.TableS.Schema().TableName)
+
+		err := config.TableS.Delete(uint64(key))
+		if err != nil {
+			return err
+		}
+		return config.TableS.Insert(record)
 	}
-	config.txnBuffer = append(config.txnBuffer, wr)
+}
+
+func commandInsert(config *DatabaseConfig, params []string, w io.Writer) error {
+
+	fieldCount := len(config.TableS.Schema().Fields)
+
+	if len(params) != fieldCount {
+		return fmt.Errorf("need %d parameters for fields: %v", fieldCount, config.TableS.Schema().GetFieldNames())
+	}
+
+	// parse record
+	record := make(schema.Record)
+	for i, field := range config.TableS.Schema().Fields {
+		// parse params[i] according to field.type
+		value, err := schema.ParseValue(params[i], field.Type)
+		if err != nil {
+			return fmt.Errorf("invalid value for %s: %v", field.Name, err)
+		}
+		record[field.Name] = value
+	}
+	if config.inTransaction {
+		wr, err := config.TableS.PrepareInsert(record)
+		if err != nil {
+			return err
+		}
+		config.txnBuffer = append(config.txnBuffer, wr)
+	} else {
+		if err := config.TableS.Insert(record); err != nil {
+			return err
+		}
+	}
+
 	return nil
 }
 
