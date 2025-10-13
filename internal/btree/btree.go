@@ -1,12 +1,10 @@
 package btree
 
 import (
-	"encoding/binary"
 	"errors"
 	"fmt"
 	"godb/internal/pager"
 	"godb/internal/schema"
-	"os"
 )
 
 type BTree struct {
@@ -93,7 +91,7 @@ func (bt *BTree) handleRootSplit(promotedKey uint64, leftChildID, rightChildID p
 	return bt.writeNode(newRoot)
 }
 
-func (bt *BTree) propogateSplit(promotedKey uint64, rightPageID, leftPageID pager.PageID, breadcrumbs *BTStack) error {
+func (bt *BTree) propogateSplit(promotedKey uint64, rightPageID, leftPageID pager.PageID, breadcrumbs *BTStack, sequential bool) error {
 	// leftPageID and rightPageID represent the two children from the most recent split
 	// promotedKey is the separator between them
 
@@ -130,7 +128,7 @@ func (bt *BTree) propogateSplit(promotedKey uint64, rightPageID, leftPageID page
 
 		// page must have been full, now we split
 		nextPage := bt.allocatePage()
-		rightNode, newPromotedKey, err := parent.splitNode(nextPage)
+		rightNode, newPromotedKey, err := parent.splitNode(nextPage, sequential) // never consider internals sequential
 		if err != nil {
 			return err
 		}
@@ -190,7 +188,11 @@ func (bt *BTree) Insert(key uint64, data []byte) error {
 
 	// page was full, time to split
 	nextPage := bt.allocatePage()
-	rightNode, promotedKey, err := leaf.splitNode(nextPage)
+
+	// check to see if insertion is sequential
+	sequential := len(leaf.Records) > 0 && key > leaf.GetKey(int(leaf.NumSlots)-1)
+
+	rightNode, promotedKey, err := leaf.splitNode(nextPage, sequential)
 	if err != nil {
 		return err
 	}
@@ -224,7 +226,7 @@ func (bt *BTree) Insert(key uint64, data []byte) error {
 		return err
 	}
 
-	return bt.propogateSplit(promotedKey, rightNode.PageID, leafPageID, breadcrumbs)
+	return bt.propogateSplit(promotedKey, rightNode.PageID, leafPageID, breadcrumbs, sequential)
 }
 
 func (bt *BTree) Search(key uint64) ([]byte, bool, error) {
@@ -361,20 +363,10 @@ func (bt *BTree) findRightSibling(parent *BNode, childIndex int) (pager.PageID, 
 	return siblingID, separatorIndex, true
 }
 
-func (bt *BTree) mergeInternalNodes(sibling, underflowNode, parent *BNode, separatorIndex int, mergeIntoSibling bool) error {
+func (bt *BTree) mergeInternalNodes(leftNode, rightNode, parent *BNode, separatorIndex int) error {
 	// true = we get merged into left, false = right merged into us
-	if sibling.IsLeaf() || underflowNode.IsLeaf() || parent.IsLeaf() {
+	if leftNode.IsLeaf() || rightNode.IsLeaf() || parent.IsLeaf() {
 		return errors.New("both siblings and parent must be INTERNAL nodes, not leaves")
-	}
-
-	// determine left or right
-	var leftNode, rightNode *BNode
-	if mergeIntoSibling {
-		leftNode = sibling
-		rightNode = underflowNode
-	} else {
-		leftNode = underflowNode
-		rightNode = sibling
 	}
 
 	// get the key to demote
@@ -418,21 +410,10 @@ func (bt *BTree) mergeInternalNodes(sibling, underflowNode, parent *BNode, separ
 	return nil
 }
 
-func (bt *BTree) mergeLeafNodes(sibling, underflowNode, parent *BNode, separatorIndex int, mergeIntoSibling bool) error {
+func (bt *BTree) mergeLeafNodes(leftNode, rightNode, parent *BNode, separatorIndex int) error {
 	// true = we get merged into left, false = right merged into us
-	if !sibling.IsLeaf() || !underflowNode.IsLeaf() || parent.IsLeaf() {
+	if !leftNode.IsLeaf() || !rightNode.IsLeaf() || parent.IsLeaf() {
 		return errors.New("both siblings must be LEAF, parent must be INTERNAL")
-	}
-
-	var leftNode, rightNode *BNode
-	if mergeIntoSibling {
-		// Found left sibling - merge right into left
-		leftNode = sibling
-		rightNode = underflowNode
-	} else {
-		// Found right sibling - merge right into left
-		leftNode = underflowNode
-		rightNode = sibling
 	}
 
 	// always merge right into left
@@ -547,16 +528,37 @@ func (bt *BTree) handleUnderflow(pageID pager.PageID, breadcrumbs *BTStack) erro
 	}
 	defer bt.pc.UnPin(sibling.PageID)
 
+	var leftNode, rightNode *BNode
+	if mergeIntoSibling {
+		// found left sibling - left is healthy, right is underfull
+		leftNode = sibling
+		rightNode = underflowNode
+	} else {
+		// found right sibling - left is underfull, right is healthy
+		leftNode = underflowNode
+		rightNode = sibling
+	}
+
+	// mergeIntoSibling == false means we found a right sibling
+	if !mergeIntoSibling && sibling.CanLendKeys() {
+		// and it can lend!
+		if leftNode.IsLeaf() {
+			return bt.borrowFromRightLeaf(leftNode, rightNode, parent, separatorIndex)
+		} else {
+			return bt.borrowFromRightInternal(leftNode, rightNode, parent, separatorIndex)
+		}
+	}
+
 	// check if merge is possible (skip if too large)
-	if !sibling.CanMergeWith(underflowNode.SlottedPage) {
+	if !leftNode.CanMergeWith(rightNode.SlottedPage) {
 		return nil // no merge occurs (this can be optimized later with "borrowing" or rebalances)
 	}
 
 	// perform merge based on node type
-	if underflowNode.IsLeaf() {
-		err = bt.mergeLeafNodes(sibling, underflowNode, parent, separatorIndex, mergeIntoSibling)
+	if leftNode.IsLeaf() {
+		err = bt.mergeLeafNodes(leftNode, rightNode, parent, separatorIndex)
 	} else {
-		err = bt.mergeInternalNodes(sibling, underflowNode, parent, separatorIndex, mergeIntoSibling)
+		err = bt.mergeInternalNodes(leftNode, rightNode, parent, separatorIndex)
 	}
 
 	if err != nil {
@@ -631,86 +633,6 @@ func (bt *BTree) Vacuum() error {
 		return err
 	}
 	return bt.pc.ReplaceTreeFromPages(pages, rootID)
-}
-
-func (bt *BTree) oldVacuum() error {
-	// update to bulk loading
-	// update to push file operations into PageCache? Maybe use Vacuum() to build a new tree
-	// then have pc.UpdateTree(bt BTree) actually handle the behind the curtain file swap
-
-	tempFile := bt.pc.GetSchema().TableName + ".db.tmp"
-	f, err := os.Create(tempFile)
-	if err != nil {
-		return err
-	}
-	tempDM := pager.NewDiskManager(f)
-
-	// Create fresh header with same schema but reset page IDs
-	freshHeader := pager.DefaultTableHeader(bt.pc.GetSchema())
-	tempDM.SetHeader(freshHeader)
-	if err := tempDM.WriteHeader(); err != nil {
-		return err
-	}
-
-	// Create fresh root page
-	rootPage := pager.NewSlottedPage(1, pager.LEAF)
-	if err := tempDM.WriteSlottedPage(rootPage); err != nil {
-		return err
-	}
-
-	newTree := NewBTree(&tempDM, &freshHeader)
-	leafID, err := bt.findLeaf(0, &BTStack{})
-	if err != nil {
-		return err
-	}
-
-	for leafID != 0 {
-		leaf, err := bt.loadNode(leafID)
-		if err != nil {
-			return err
-		}
-
-		for i := 0; i < int(leaf.NumSlots); i++ {
-			record := leaf.Records[i]
-			if len(record) < 8 {
-				continue // skip malformed records
-			}
-			// Extract key from first 8 bytes
-			key := binary.LittleEndian.Uint64(record[:8])
-			if err := newTree.Insert(key, record); err != nil {
-				// Skip duplicates (caused by stale pointers to freed pages)
-				if err.Error() != fmt.Sprintf("key %d already exists", key) {
-					bt.pc.UnPin(leaf.PageID)
-					return err
-				}
-			}
-		}
-		bt.pc.UnPin(leaf.PageID)
-		leafID = leaf.NextLeaf
-	}
-
-	// Flush new tree (pages + header) and close the file
-	if err := newTree.pc.Close(); err != nil {
-		return err
-	}
-
-	// close the old file
-	if err := bt.pc.Close(); err != nil {
-		return err
-	}
-
-	// rename temp file to original file name
-	origFile := bt.pc.GetSchema().TableName + ".db"
-	if err := os.Rename(tempFile, origFile); err != nil {
-		return err
-	}
-
-	// reopen with new file
-	f, err = os.OpenFile(origFile, os.O_RDWR, 0644)
-	if err != nil {
-		return err
-	}
-	return bt.pc.UpdateFile(f)
 }
 
 func (bt *BTree) ExtractPrimaryKey(record schema.Record) (uint64, error) {
@@ -867,4 +789,99 @@ func (bt *BTree) GetWalMetadata() (rootPageID, nextPageID uint32) {
 
 func (bt *BTree) Checkpoint() error {
 	return bt.pc.FlushAll()
+}
+
+func (bt *BTree) borrowFromRightLeaf(leftNode, rightNode, parent *BNode, separatorIndex int) error {
+	if !leftNode.IsLeaf() || !rightNode.IsLeaf() || parent.IsLeaf() {
+		return errors.New("both siblings must be LEAF, parent must be INTERNAL")
+	}
+
+	// 1. get first record from right sibling
+	if rightNode.NumSlots == 0 {
+		return fmt.Errorf("right sibling has no records to lend")
+	}
+	borrowedRecord := rightNode.Records[0]
+
+	// 2. remove from right leaf
+	if err := rightNode.DeleteRecord(0); err != nil {
+		return err
+	}
+
+	// 3. Insert into left
+	if _, err := leftNode.InsertRecordSorted(borrowedRecord); err != nil {
+		return err
+	}
+
+	// 4. Update the parent separator
+	if rightNode.NumSlots == 0 {
+		return fmt.Errorf("right sibling empty after borrowing")
+	}
+
+	// considers shift from compact on delete
+	newSeparatorKey := rightNode.GetKey(0) // right's new first key (was second key)
+	parent.Records[separatorIndex] = pager.SerializeInternalRecord(newSeparatorKey, leftNode.PageID)
+
+	// 5. write all three modified pages
+	if err := bt.writeNode(leftNode); err != nil {
+		return err
+	}
+	if err := bt.writeNode(rightNode); err != nil {
+		return err
+	}
+	if err := bt.writeNode(parent); err != nil {
+		return err
+	}
+
+	return nil
+}
+
+func (bt *BTree) borrowFromRightInternal(leftNode, rightNode, parent *BNode, separatorIndex int) error {
+	if leftNode.IsLeaf() || rightNode.IsLeaf() || parent.IsLeaf() {
+		return errors.New("both siblings and parent must be INTERNAL nodes, not leaves")
+	}
+
+	// get the key to demote
+	separatorKey, _ := pager.DeserializeInternalRecord(parent.Records[separatorIndex])
+
+	// 1. demote: insert separator into the left, pointing to the left's rightmostchild
+	demotedRecord := pager.SerializeInternalRecord(separatorKey, leftNode.RightmostChild)
+	_, err := leftNode.InsertRecordSorted(demotedRecord)
+	if err != nil {
+		return err
+	}
+
+	// 2. Get first record from right
+	if rightNode.NumSlots == 0 {
+		return fmt.Errorf("right sibling has no records to lend")
+	}
+	_, borrowedChild := pager.DeserializeInternalRecord(rightNode.Records[0])
+
+	// 3. move child pointer from right to left
+	leftNode.RightmostChild = borrowedChild
+
+	// 4. remove borrow record from right
+	if err := rightNode.DeleteRecord(0); err != nil {
+		return err
+	}
+
+	// 5. promote right's new first key to parent (after delete index 0 is now old index 1 from compact after delete)
+	if rightNode.NumSlots == 0 {
+		return fmt.Errorf("right sibling empty after borrow")
+	}
+
+	newSeparatorKey := rightNode.GetKey(0)
+	parent.Records[separatorIndex] = pager.SerializeInternalRecord(newSeparatorKey, leftNode.PageID)
+
+	// 6. write all three modified pages
+	if err := bt.writeNode(leftNode); err != nil {
+		return err
+	}
+	if err := bt.writeNode(rightNode); err != nil {
+		return err
+	}
+	if err := bt.writeNode(parent); err != nil {
+		return err
+	}
+
+	return nil
 }

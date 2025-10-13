@@ -5,7 +5,7 @@
       #echo "create stress id:int data:string value:float"
       echo "use stress"
 
-      for i in {1..100}; do
+      for i in {1..5000}; do
 	#key=$((i*2))
           echo "delete $i"
       done

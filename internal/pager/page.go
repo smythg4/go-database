@@ -319,7 +319,7 @@ func (sp *SlottedPage) Compact() error {
 	return nil
 }
 
-func (sp *SlottedPage) SplitLeaf(newPageID PageID) (*SlottedPage, uint64, error) {
+func (sp *SlottedPage) SplitLeaf(newPageID PageID, sequential bool) (*SlottedPage, uint64, error) {
 	if sp.PageType != LEAF {
 		return nil, 0, errors.New("attempting to split a non-leaf page as LEAF")
 	}
@@ -329,7 +329,12 @@ func (sp *SlottedPage) SplitLeaf(newPageID PageID) (*SlottedPage, uint64, error)
 		return nil, 0, err
 	}
 
+	// keep 70% in original leaf if this is a sequential insert
 	mid := sp.NumSlots / 2
+	if sequential {
+		mid = (sp.NumSlots * 7) / 10
+	}
+
 	newPage := NewSlottedPage(newPageID, sp.PageType)
 	for i := mid; i < sp.NumSlots; i++ {
 		record := sp.Records[i]
@@ -354,7 +359,7 @@ func (sp *SlottedPage) SplitLeaf(newPageID PageID) (*SlottedPage, uint64, error)
 	return newPage, promotedKey, nil
 }
 
-func (sp *SlottedPage) SplitInternal(newPageID PageID) (*SlottedPage, uint64, error) {
+func (sp *SlottedPage) SplitInternal(newPageID PageID, sequential bool) (*SlottedPage, uint64, error) {
 	if sp.PageType != INTERNAL {
 		return nil, 0, errors.New("attempting to split a non-internal page as INTERNAL")
 	}
@@ -364,7 +369,11 @@ func (sp *SlottedPage) SplitInternal(newPageID PageID) (*SlottedPage, uint64, er
 		return nil, 0, err
 	}
 
+	// keep 70% in original leaf if this is a sequential insert
 	mid := sp.NumSlots / 2
+	if sequential {
+		mid = (sp.NumSlots * 7) / 10
+	}
 	promotedKey := sp.GetKey(int(mid))
 	newPage := NewSlottedPage(newPageID, sp.PageType)
 	for i := mid + 1; i < sp.NumSlots; i++ {
@@ -442,4 +451,20 @@ func (sp *SlottedPage) MergeInternals(sibling *SlottedPage) error {
 	// update the rightmost child to reflect the sibling's rightmostchild
 	sp.RightmostChild = sibling.RightmostChild
 	return nil
+}
+
+func (sp *SlottedPage) CanLendKeys() bool {
+	if sp.NumSlots < 3 {
+		return false
+	}
+
+	if len(sp.Records) == 0 {
+		return false
+	}
+
+	// assumes first record isn't tombstoned. Works as long as we keep compact on delete
+	firstRecordSize := uint16(len(sp.Records[0]))
+	projectedUsedSpace := sp.GetUsedSpace() - firstRecordSize - 4 // record plus slot size
+
+	return projectedUsedSpace >= PAGE_SIZE/2
 }

@@ -11,10 +11,10 @@ echo "Creating fresh test table..."
 echo -e "create reuse id:int data:string value:float\n.exit" | nc localhost 42069
 
 echo ""
-echo "Phase 1: Inserting records 1-100..."
+echo "Phase 1: Inserting records 1-1000..."
 {
     echo "use reuse"
-    for i in {1..100}; do
+    for i in {1..1000}; do
         value=$(echo "scale=1; $i * 1.1" | bc)
         echo "insert $i data_$i $value"
     done
@@ -25,10 +25,10 @@ echo "Phase 1 complete. Checking stats..."
 echo -e "use reuse\nstats\ncount\n.exit" | nc localhost 42069
 
 echo ""
-echo "Phase 2: Deleting records 26-100 (75 deletions)..."
+echo "Phase 2: Deleting records 100-201 (100 deletions)..."
 {
     echo "use reuse"
-    for i in {26..100}; do
+    for i in {100..201}; do
         echo "delete $i"
     done
     echo ".exit"
@@ -38,10 +38,10 @@ echo "Phase 2 complete. Checking stats after deletions..."
 echo -e "use reuse\nstats\ncount\n.exit" | nc localhost 42069
 
 echo ""
-echo "Phase 3: Inserting records 101-200 (100 more inserts)..."
+echo "Phase 3: Inserting records 1001-1100 (100 more inserts)..."
 {
     echo "use reuse"
-    for i in {101..200}; do
+    for i in {1001..1100}; do
         value=$(echo "scale=1; $i * 2.2" | bc)
         echo "insert $i data_$i $value"
     done

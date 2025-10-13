@@ -139,6 +139,12 @@ func (bts *BTreeStore) Insert(record schema.Record) error {
 		return err
 	}
 
+	// CRASH HERE: WAL written, but tree not modified
+	// if key == 999 { // Special test key
+	// 	fmt.Println("SIMULATING CRASH!")
+	// 	os.Exit(1)
+	// }
+
 	return bts.bt.Insert(key, data)
 }
 
@@ -243,14 +249,18 @@ func (bts *BTreeStore) Checkpoint() error {
 	bts.mu.Lock()
 	defer bts.mu.Unlock()
 
-	if err := bts.bt.Checkpoint(); err != nil {
-		return err
-	}
-
+	// Write checkpoint START marker
 	if err := bts.LogCheckpoint(); err != nil {
 		return err
 	}
 
+	// Flush pages
+	if err := bts.bt.Checkpoint(); err != nil {
+		return err
+	}
+
+	// Sync to ensure pages are durable
+	// Now safe to truncate WAL
 	return bts.wal.Truncate()
 }
 

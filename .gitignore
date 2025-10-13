@@ -30,6 +30,9 @@ go.work.sum
 # db files
 *.db
 
+# wal files
+*.wal 
+
 # log files
 *.log
 
