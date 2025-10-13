@@ -4,439 +4,448 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-A handrolled database implementation in Go with multi-client TCP server support, custom schema system, and persistent binary storage. Built as a learning project following "Database Internals" by Alex Petrov, with the goal of eventually implementing B-tree page-based storage.
+A handrolled database implementation in Go (~6500 LOC) featuring a B+ tree storage engine, write-ahead logging, ACID transactions, and concurrent TCP server. Built as a learning project following "Database Internals" by Alex Petrov, with full page-based storage, caching, and transaction support.
 
-## Architecture
-
-### Active Storage Layer (`internal/store`)
-
-**btree_store.go** - Primary storage implementation using B+ tree (current backend):
-- `BTreeStore`: Thin wrapper around B+ tree with schema-aware operations
-- Implements full CRUD interface (Insert, Find, Delete, ScanAll)
-- `sync.RWMutex` for concurrent access protection (Insert/Delete use Lock, Find/ScanAll use RLock)
-- Key methods:
-  - `Insert(record)`: Extracts first field as uint64 key, serializes record, calls bt.Insert
-  - `Delete(key uint64)`: Deletes record from tree, may trigger merges
-  - `Find(id)`: Searches B+ tree via bt.Search, deserializes result
-  - `ScanAll()`: Full table scan via bt.RangeScan(0, MaxUint64), deserializes all records
-  - `Schema()`: Returns read-only schema from bt.Header.Schema
-  - `Stats()`: Exposes tree structure for debugging (root page, type, NextPageID)
-- Constructor helpers: `NewBTreeStore(filename)` opens existing, `CreateBTreeStore(filename, schema)` creates new
-- **Critical pattern**: Primary key (first field) must be int32, cast to uint64 for tree operations
-
-**table.go** - Legacy append-only log storage (replaced by BTreeStore):
-- `TableStore`: Schema-based table storage with binary serialization
-- File format: Schema header (table name, field definitions) + variable-length records
-- Deduplication on read: `ScanAll()` returns latest record per ID
-- Helper functions: `writeValue/readValue` for type-aware serialization
-- **Status**: No longer used by CLI, kept for reference
-
-**kv.go** - Simple key-value storage (legacy, still used for testing):
-- Append-only int32 key-value pairs as 8-byte records
-- Linear backward search for latest value
-
-### Schema System (`internal/schema`)
-
-**schema.go** - Type definitions and parsing:
-- `Schema`: Table name + field definitions
-- `Field`: Name and FieldType (IntType=0, StringType=1, BoolType=2, FloatType=3)
-- `Record`: map[string]any for row data
-- `ParseFieldType(string)`: Converts "int", "string", "bool", "float" to FieldType enum
-- `ParseValue(string, FieldType)`: Parses user input to typed values
-
-### CLI/Network Layer (`cmd/main.go` + `internal/cli`)
-
-**main.go** - Entry point with dual interface:
-- Local REPL: Interactive prompt showing current table name
-- TCP Server: Listens on port 42069, handles concurrent connections
-- `ProcessCommand`: Routes commands through `io.Writer` abstraction (works for stdout or net.Conn)
-- Per-session config: Each TCP client gets isolated `DatabaseConfig` but shares TableStore instances via cache
-
-**commands.go** - Command implementations:
-- Table cache: `GetOrOpenTable(filename)` ensures single BTreeStore instance per file (critical for mutex to work)
-- Commands write to `io.Writer` parameter, return errors
-- SQL-like: `create`, `use`, `show`, `describe`, `insert`, `select [id] [start end]`, `update <values>`, `delete <id>`, `count [id] [start end]`, `drop <table>`, `stats`
-- Dynamic schema: INSERT/SELECT/UPDATE adapt to current table's field definitions
-- Formatted output: Column-aligned tables with field names as headers
-- **Range queries**: `select <start> <end>` and `count <start> <end>` use RangeScan for efficient range operations
-- **Schema introspection**: `describe` shows table structure with field types and primary key
-- `delete <id>`: Finds record by key, displays it, then calls Delete (triggers merges, updates free list)
-- `update <values>`: Naive implementation using DELETE + INSERT (shows record being updated)
-- `drop <table>`: Removes .db file (includes graceful handling for non-existent files)
-- `stats` command: Shows tree structure (root page ID, type, NextPageID allocation, tree depth)
-
-### B+ Tree Storage Engine (`internal/pager` + `internal/btree`)
-
-**Page Cache Layer (`internal/pager/page_cache.go`)** - Buffer pool for page caching:
-- `PageCache`: In-memory cache with Clock eviction policy (maxCacheSize = 200 pages)
-- `CacheRecord`: Tracks page data, dirty flag, pin count, and reference bit for each cached page
-- Pin/unpin semantics prevent eviction of in-use pages during tree operations
-- Key methods:
-  - `Fetch(id)`: Returns page from cache or loads from disk, auto-pins on fetch, sets refBit
-  - `AddNewPage(sp)`: Adds new page to cache, marks dirty, and pins it
-  - `UnPin(id)`: Decrements pin count, allowing eviction when count reaches 0
-  - `Evict()`: Clock eviction with second-chance algorithm, flushes dirty pages before eviction
-  - `MakeDirty(id)`: Marks cached page as dirty (needs flush on eviction)
-  - `AllocatePage()`: Allocates new PageID, checks FreePageIDs first
-  - `FreePage(id)`: Adds PageID to free list for reuse
-  - `FlushHeader()`: Writes table header to disk, auto-calculates NumPages
-  - `Close()`: Flushes all dirty pages and closes underlying file
-  - `UpdateFile(file)`: Switches to new file after VACUUM rename, clears cache
-- **Critical pattern**: BTree operations must pin pages during use, unpin via defer when done
-- **Eviction strategy**: Clock algorithm gives "second chance" to recently accessed pages via refBit before eviction
-- **Header management**: PageCache owns header pointer, BTree accesses via Get/Set methods
-- **Concurrency**: PageCache.mu protects cache map and clock queue, BTreeStore.mu serializes BTree access
-- **Cache size**: 200 pages (800KB with 4KB pages), sized to handle deep tree operations without exhausting cache
-
-**Page Layer (`internal/pager/page.go`)** - Slotted page implementation:
-- `SlottedPage`: In-memory representation with 13-byte header, slot array, and records
-  - Header: PageType (LEAF/INTERNAL), NumSlots, FreeSpacePtr, RightmostChild, NextLeaf
-  - NextLeaf forms sibling chain for efficient range scans (B+ tree feature)
-  - Slot array grows down from byte 13, records grow up from end
-  - 4KB fixed page size (PAGE_SIZE = 4096)
-- Key methods:
-  - `InsertRecordSorted`: Binary search insertion maintaining key order
-  - `DeleteRecord`: Tombstone approach (mark Offset=0, Length=0, Records[i]=nil, NumSlots--), bounds check uses `len(Records)` not NumSlots
-  - `Search`: **Linear scan** for exact key match in leaf nodes (binary search breaks with tombstones), skips nil Records, early exit when key > target
-  - `SearchInternal`: Routes search to correct child page in internal nodes, binary search with tombstone skip (moves right when mid is tombstone)
-  - `findInsertionPosition`: Binary search for insertion position, skips tombstones during search
-  - `SplitLeaf/SplitInternal`: Node splitting with promoted key handling and child pointer updates, **calls Compact() first** to ensure NumSlots == len(Records)
-  - `MergeLeaf/MergeInternals`: Combine two nodes (updates NextLeaf chain for leaves), iterates over `len(sibling.Records)` not NumSlots, calls Compact first
-  - `CanMergeWith`: Check if two pages fit together (combined size + slot overhead ≤ PAGE_SIZE)
-  - `IsUnderfull`: Returns true if GetUsedSpace() < PAGE_SIZE/2
-  - `GetUsedSpace()`: Calculates space used by active records only (skips tombstones where Offset=0)
-  - `Compact`: Removes tombstone gaps by repacking active records, called before splits/merges
-  - `Serialize/Deserialize`: Convert between in-memory (13-byte header) and disk ([4096]byte array)
-- Record formats:
-  - Leaf: [key: 8 bytes][full record data: variable]
-  - Internal: [key: 8 bytes][child PageID: 4 bytes]
-- First field in schema is always the key
-- **Tombstone model**: DeleteRecord doesn't compact immediately, allows tombstones to accumulate, Compact called only before splits/merges
-- **Critical tombstone bug pattern**: `NumSlots` = active record count (decrements on delete), `len(Records)` = array size with tombstones. ALL iteration must use `len(Records)`, ALL bounds checks must use `len(Records)`. Using NumSlots causes records at high indices to be skipped.
-
-**Table Metadata (`internal/pager/header.go`)**:
-- `TableHeader`: Magic ("GDBT"), version, RootPageID, NextPageID, NumPages, Schema, FreePageIDs
-- Page 0 reserved for header (padded to 4KB), B-tree nodes start at page 1
-- NextPageID tracks next available page for allocation during splits
-- **FreePageIDs**: Slice of PageIDs freed during merges, reused before allocating new pages
-- `DefaultTableHeader(schema)`: Helper for creating initial headers with schema
-- **Critical durability pattern**: BTree modifies its own header copy (RootPageID/NextPageID/FreePageIDs), must sync back to DiskManager before WriteHeader
-- **Serialization**: FreePageIDs serialized as uint32 count + array of PageIDs (4 bytes each)
-
-**Disk I/O (`internal/pager/disk_manager.go`)**:
-- `ReadPage/WritePage`: Load/store raw Page at offset (pageID * PAGE_SIZE)
-- `ReadSlottedPage/WriteSlottedPage`: High-level wrappers with serialization
-- `ReadHeader/WriteHeader`: Table metadata at offset 0 (WriteHeader calls Sync())
-- `Sync()`: Flushes OS buffers to disk (critical for durability)
-- **WritePage now calls Sync()**: Each page write is immediately flushed (performance cost, but ensures durability)
-
-**B-Tree Orchestration (`internal/btree/btree.go`)**:
-- `BTree`: Manages tree structure via PageCache (which wraps DiskManager)
-- `BNode`: Thin wrapper around SlottedPage for tree-specific operations
-- `NewBTree(dm, header)`: Constructor creates PageCache, returns BTree with pc field
-- **Integration with PageCache**:
-  - `loadNode(id)`: Calls `pc.Fetch(id)`, wraps in BNode (auto-pins page)
-  - `writeNode(node)`: Checks if page cached via `pc.Contains()`, adds via `AddNewPage()` if not, then calls `MakeDirty()`
-  - All loadNode calls followed by `defer bt.pc.UnPin(node.PageID)` to allow eviction
-  - New pages from splits immediately pinned via AddNewPage, unpinned at end of operation
-- **Free Page Management**:
-  - `allocatePage()`: Calls `pc.AllocatePage()` which checks FreePageIDs first
-  - Merge operations call `pc.FreePage(orphanedPageID)` to add to free list
-  - **No mutex protection**: BTreeStore's RWMutex serializes all BTree access, so FreePageIDs is implicitly protected
-- Key algorithms:
-  - `Insert`: Uses breadcrumb stack to track descent path, handles splits bottom-up
-    - **Critical**: Defer pattern flushes header at end: `defer bt.pc.FlushHeader()`
-    - Pins pages during descent, unpins via defer when done
-  - `Delete`: Traverses to leaf, deletes record, writes leaf BEFORE checking underflow, handles merges
-    - **Critical**: Same defer pattern as Insert for header flush
-    - Writes modified leaf before underflow check to ensure durability
-    - Pins pages during descent, unpins via defer when done
-  - `propagateSplit`: Inserts promoted keys into parents, cascades splits up tree
-  - `handleRootSplit`: Creates new internal root when root overflows (tree height growth)
-  - `handleUnderflow`: Detects underflow, finds sibling, attempts merge, recurses on parent underflow
-    - **Critical**: Writes parent BEFORE checking parent underflow (prevents stale parent pointers)
-  - `handleRootUnderflow`: Collapses root when internal root has NumSlots=0 (only RightmostChild remains)
-  - `mergeLeafNodes/mergeInternalNodes`: Combines siblings, updates parent pointers with tombstone awareness
-    - Internal merge demotes separator key: `SerializeInternalRecord(separatorKey, leftNode.RightmostChild)`
-    - **Tombstone handling**: After DeleteRecord, finds next non-tombstone record to update pointer (records don't shift)
-  - `findLeftSibling/findRightSibling`: Navigates parent to locate merge partners
-  - `Search`: Descends tree using SearchInternal/Search, max depth check prevents infinite loops
-  - `RangeScan`: Follows NextLeaf sibling chain with cycle detection, iterates over `len(leaf.Records)` not NumSlots to include all records
-  - `Stats()`: Debug helper showing root page ID, type, NextPageID allocation
-  - `Close()`: Calls `pc.Close()` which flushes all dirty pages and closes file
-  - `findLeftSibling/findRightSibling`: Skip tombstones when navigating parent records to find siblings (backward/forward scan)
-  - `Vacuum`: Triggers bulk loading rebuild via `BulkLoad()`
-  - `BulkLoad`: O(n) tree reconstruction - scans leaves sequentially, builds dense leaf layer, constructs internal layers bottom-up, writes to temp file, renames atomically
-- Breadcrumb stack pattern (from Petrov): Tracks PageID and child index during descent for split/merge propagation
-- Child pointer management: After inserting promoted key at position i, updates record[i+1] or RightmostChild
-
-**Critical Implementation Details:**
-- Split propagation updates child pointers: When `[key, leftPageID]` inserted at index i, the next record (i+1) must point to rightPageID, or RightmostChild if last
-- Sibling chain maintenance: During SplitLeaf, `newPage.NextLeaf = oldPage.NextLeaf` then `oldPage.NextLeaf = newPageID`
-- **Header durability**: BTree modifies header via PageCache methods (SetRootPageID, AllocatePage, FreePage), FlushHeader syncs to disk. Implemented as defer at start of Insert/Delete.
-- **Pin/unpin discipline**: Every loadNode must have corresponding UnPin, typically via defer. New pages from AddNewPage also pinned.
-- **Tombstone-aware pointer updates**: After DeleteRecord in merge operations, must find next non-tombstone record to update child pointer (records don't shift with tombstone model)
-- Search safety: Max depth 100 prevents infinite loops from corrupted page structures
-- Primary key constraint: First field in schema must be int32 (cast to uint64 for key operations)
-
-**Test Coverage (`internal/btree/btree_test.go` + `internal/pager/page_test.go`)**:
-- Insert without split (single leaf)
-- Insert with root split (tree height 1 → 2)
-- Search in single-level and multi-level trees
-- Range scan across multiple leaves via sibling pointers
-- Page serialization round-trips
-- Split mechanics (leaf/internal with child pointer validation)
-- **Integration testing**: Stress test with 150 inserts verified multi-level tree growth (root split from page 1 → page 3)
+**Key Stats:**
+- 4KB fixed page size with slotted layout
+- 250-page buffer pool with Clock eviction
+- CRC32 page-level checksums
+- Multi-client TCP server (port 42069)
+- Channel-based WAL writer (single goroutine, no contention)
+- Context-based graceful shutdown
 
 ## Development Commands
 
 ```bash
-# Build and run with server logs to stderr
-go build -o godb cmd/main.go && ./godb 2>server.log
-
-# Run the database (logs to stderr by default)
-./godb
+# Build and run
+go build -o godb cmd/main.go
+./godb 2>server.log        # logs to stderr
 
 # Connect via TCP
 nc localhost 42069
 
-# Format and vet
-go fmt ./...
-go vet ./...
-
-# Run all tests
-go test ./...
-
-# Run B-tree tests
+# Testing
+go test ./...               # all tests
 go test -v ./internal/btree/
-
-# Run specific test
 go test -v -run TestInsertWithRootSplit ./internal/btree/
 
-# Run page-related tests
-go test -v ./internal/pager/
-
-# Benchmark B+Tree vs legacy storage
+# Benchmarks
 go test -bench=. -benchmem ./internal/store/
 
 # Stress tests (require running server)
-./test_concurrent.sh   # 5000 concurrent inserts across 5 clients
-./test_chaos.sh        # Concurrent inserts + deletes (tests merges and free list)
-./test_freelist.sh     # Verifies free page reuse after chaos test
-./stress_test.sh       # 10000 sequential inserts
-./stress_delete.sh     # Delete many records (tests merge logic)
+./test_chaos.sh            # concurrent inserts + deletes
+./test_reuse.sh            # free page reuse verification
+./stress_test.sh           # 10k sequential inserts
+
+# Format and vet
+go fmt ./...
+go vet ./...
 ```
+
+## Architecture Overview
+
+```
+cmd/main.go              - TCP server + REPL with graceful shutdown
+internal/cli/            - Command parsing, transaction state, table cache
+internal/store/          - BTreeStore wrapper (transactions, WAL integration)
+internal/btree/          - B+ tree operations (insert, delete, search, merge, split, borrow)
+internal/pager/          - Page cache, disk I/O, slotted pages, WAL manager, checksums
+internal/schema/         - Schema definition and binary serialization
+internal/encoding/       - LittleEndian helpers for binary I/O
+```
+
+## CLI Commands
+
+All commands are case-insensitive. First field of schema is always primary key (must be `int` type).
+
+**Table Management:**
+- `create <table> <field:type> ...` - Create table (first field is primary key)
+- `use <table>` - Switch active table
+- `show` - List all tables (.db files)
+- `describe` - Show schema for active table
+- `drop <table>` - Delete table file
+- `stats` - Show B+ tree statistics (root page, depth, page count)
+
+**Data Operations:**
+- `insert <val1> <val2> ...` - Insert record (auto-commit or buffered if in transaction)
+- `select` - Full table scan
+- `select <id>` - Find by primary key
+- `select <start> <end>` - Range scan
+- `update <val1> <val2> ...` - Update record (DELETE + INSERT pattern)
+- `delete <id>` - Delete by primary key
+- `count` - Count all records
+- `count <id>` - Count single record
+- `count <start> <end>` - Count range
+
+**Transaction Commands:**
+- `begin` - Start transaction (buffers INSERT/DELETE/UPDATE)
+- `commit` - Batch log to WAL, then apply operations to tree
+- `abort` - Discard buffered operations
+
+**Maintenance:**
+- `vacuum` - Rebuild tree with bulk loading (O(n), ~50% space savings, 10x faster than insert-based rebuild)
+- `recover` - Manually replay WAL (normally automatic on startup)
+
+**System:**
+- `.help` - Show all commands
+- `.exit` - Checkpoint and close (TCP clients just disconnect)
+
+**Supported Types:** `int` (int32), `string`, `float` (float64), `bool`, `date` (YYYY-MM-DD)
+
+## Core Components
+
+### Page Layer (`internal/pager/page.go`)
+
+**SlottedPage** - 4KB pages with 13-byte header:
+- Header: `[PageType:1][NumSlots:2][FreeSpacePtr:2][RightmostChild:4][NextLeaf:4]`
+- Slot array grows down from byte 13, records grow up from byte 4091
+- Trailer: CRC32 checksum at bytes 4092-4096
+- Page types: LEAF (0) or INTERNAL (1)
+- `NextLeaf` forms sibling chain for range scans
+
+**Key Methods:**
+- `InsertRecordSorted(data)` - Binary search insertion, maintains key order
+- `DeleteRecord(index)` - Tombstone + immediate compact (compact-on-delete strategy)
+- `Search(key)` - Binary search for exact key match
+- `SearchInternal(key)` - Routes to child page in internal nodes
+- `SplitLeaf/SplitInternal(newPageID, sequential)` - Node splitting (70/30 split if sequential detected)
+- `MergeLeaf/MergeInternals(sibling)` - Combine underfull siblings
+- `CanMergeWith(sibling)` - Check if combined size ≤ PAGE_SIZE
+- `CanLendKeys()` - True if NumSlots ≥ 3 and would remain ≥50% full after lending
+- `IsUnderfull()` - True if used space < PAGE_SIZE/2
+- `Compact()` - Remove tombstone gaps, repack active records
+- `Serialize/Deserialize()` - Convert between memory and disk with CRC32 validation
+
+**Record Formats:**
+- Leaf: `[key:8][full record data:variable]`
+- Internal: `[key:8][child PageID:4]`
+
+**CRC32 Checksums:** Calculated over bytes 0-4091, stored at 4092-4095. Deserialize returns error on mismatch.
+
+**Compact-on-Delete Strategy:** Every `DeleteRecord()` calls `Compact()` immediately (page.go:219). Simplifies merge logic at cost of delete performance. `NumSlots` = active record count (decrements on delete), `len(Records)` = array size. Always use `len(Records)` for iteration to include all records.
+
+### Page Cache (`internal/pager/page_cache.go`)
+
+**PageCache** - Buffer pool with Clock eviction (250 pages = 1MB):
+- `CacheRecord`: Tracks page data, dirty flag, pin count, and refBit (second-chance bit)
+- Clock algorithm: refBit gives second chance before eviction, skips pinned pages
+- Pin/unpin prevents eviction during tree operations
+
+**Key Methods:**
+- `Fetch(id)` - Load from cache or disk, auto-pins, sets refBit
+- `AddNewPage(sp)` - Add to cache, mark dirty, pin
+- `UnPin(id)` - Decrement pin count (allows eviction when reaches 0)
+- `Evict()` - Clock sweep, flushes dirty pages before eviction (no sync during eviction now that we have WAL)
+- `MakeDirty(id)` - Mark page dirty (flush on eviction or Close)
+- `AllocatePage()` - Pop from FreePageIDs if available, else increment NextPageID
+- `FreePage(id)` - Evict from cache, add to free list
+- `FlushAll()` - Write all dirty pages, flush header, sync file
+- `FlushHeader()` - Write table header (auto-calculates NumPages)
+- `UpdateFile(file)` - Switch to new file after VACUUM rename, clear cache
+- `ReplaceTreeFromPages(pages, rootID)` - Atomic file replacement for VACUUM
+- `Close()` - FlushAll then close file
+
+**Critical Pattern:** BTree operations pin pages on load (`defer bt.pc.UnPin(node.PageID)`), new pages from splits pinned via `AddNewPage`.
+
+### Table Metadata (`internal/pager/header.go`)
+
+**TableHeader** - Stored at page 0 (padded to 4KB):
+- Magic: `"GDBT"`
+- Version: `uint16`
+- RootPageID: `PageID` (initially 1)
+- NextPageID: `PageID` (next available page for allocation)
+- NumPages: `uint32` (auto-calculated on flush)
+- Schema: Full schema with field definitions
+- FreePageIDs: `[]PageID` (orphaned pages from merges, reused before allocating new)
+
+### Disk I/O (`internal/pager/disk_manager.go`)
+
+Simple wrapper around `*os.File` with page-sized I/O:
+- `ReadPage/WritePage` - Raw [4096]byte at offset (pageID * PAGE_SIZE)
+- `ReadSlottedPage/WriteSlottedPage` - Deserialize/serialize with CRC32 validation
+- `ReadHeader/WriteHeader` - Table metadata at offset 0, WriteHeader calls Sync()
+- `Sync()` - Flush OS buffers to disk
+
+### B+ Tree Operations (`internal/btree/btree.go`)
+
+**BTree** - Orchestrates tree structure via PageCache:
+- `BNode`: Thin wrapper around SlottedPage
+- All operations use pin/unpin discipline
+
+**Insert Flow:**
+1. `findLeaf(key, breadcrumbs)` - Traverse to leaf, record descent path
+2. Check for duplicate key
+3. Try `InsertRecordSorted(data)` - may return "page full"
+4. On full: `allocatePage()`, `splitNode()`, write both halves
+5. Retry insert into appropriate half
+6. `propogateSplit()` - Walk breadcrumbs, insert promoted keys into parents, cascade splits up
+7. `handleRootSplit()` - Create new internal root if needed (tree height growth)
+8. `defer bt.pc.FlushHeader()` - Sync header (RootPageID, NextPageID, FreePageIDs) to disk
+
+**Sequential Insert Detection:** If `key > lastKey` in leaf, use 70/30 split ratio instead of 50/50.
+
+**Delete Flow:**
+1. `findLeaf(key, breadcrumbs)` - Traverse to leaf, record descent path
+2. `Search(key)` - Find record index
+3. `DeleteRecord(idx)` - Tombstone + immediate compact
+4. `writeNode(leaf)` - **Critical: write BEFORE checking underflow**
+5. `handleUnderflow(leafPageID, breadcrumbs)` - If underfull, attempt borrow or merge
+6. `defer bt.pc.FlushHeader()` - Sync header to disk
+
+**Underflow Handling:**
+1. Check if root (special case: collapse if internal root has 0 slots)
+2. Pop breadcrumb, load parent and underfull node
+3. Find left sibling first, else right sibling
+4. If right sibling exists and `CanLendKeys()`: `borrowFromRightLeaf/Internal()`
+5. Else if `CanMergeWith()`: `mergeLeafNodes/mergeInternalNodes()`
+6. **Critical: writeNode(parent) BEFORE recursive underflow check** (prevents stale pointers)
+7. Recurse if parent now underfull
+
+**Borrowing (Right Sibling Only):**
+- **Leaf:** Move first record from right to left, update parent separator to right's new first key
+- **Internal:** Demote parent separator to left (pointing to left's RightmostChild), move first record from right to left (becomes left's new RightmostChild), promote right's new first key to parent
+- Requires ≥3 keys in sibling, would remain ≥50% full after lending
+- **Not Implemented:** Left sibling borrowing
+
+**Merging:**
+- Always merge right into left (prefers left sibling, falls back to right if no left)
+- **Leaf:** Copy all records, update NextLeaf chain (`merged.NextLeaf = orphaned.NextLeaf`)
+- **Internal:** Demote parent separator into merged node, copy all records, update RightmostChild
+- Remove separator from parent, update parent's child pointer
+- Add orphaned page to FreePageIDs, evict from cache
+
+**Search:** Max depth 100, descends tree via `SearchInternal()` in internal nodes, `Search()` in leaf.
+
+**RangeScan:** Find leaf containing startKey, follow NextLeaf chain, cycle detection (returns error if page visited twice).
+
+**VACUUM (Bulk Loading):**
+1. `buildLeafLayer()` - Scan all leaves left-to-right via NextLeaf, pack into dense new leaves
+2. `buildInternalLayer()` - Build parent layer using first key of each child as separator, RightmostChild for last pointer
+3. Recurse until single root remains
+4. `ReplaceTreeFromPages()` - Write to `.db.tmp`, close old, rename, reopen
+5. **Critical:** Table cache reloaded after VACUUM (commands.go:223-233)
+
+**O(n) Complexity:** Sequential scan + pack, vs O(n log n) for insert-based rebuild. ~50% space savings, 10x speed improvement.
+
+### BTreeStore (`internal/store/btree_store.go`)
+
+Wrapper providing transaction support and WAL integration:
+
+**Auto-Commit Mode** (no BEGIN):
+- `Insert(record)` → LogInsert() → bt.Insert() (lines 124-149)
+- `Delete(key)` → LogDelete() → bt.Delete() (lines 151-158)
+
+**Explicit Transaction Mode** (after BEGIN):
+- `PrepareInsert(record)` → Create WALRecord WITHOUT logging (lines 304-321)
+- `PrepareDelete(key)` → Create WALRecord WITHOUT logging (lines 323-329)
+- Operations buffered in `config.txnBuffer` (per-session)
+- `Commit(txnBuffer)` → Batch send to WAL writer → Apply to tree (lines 267-302)
+
+**Background Checkpointer:**
+- 30-second ticker in `startCheckpointer()` goroutine (lines 103-122)
+- On tick or context cancellation: `Checkpoint()` → FlushAll pages → LogCheckpoint → Truncate WAL
+- Uses BTreeStore.mu (serializes with commits, adds latency)
+
+**Graceful Shutdown:**
+- Context passed to constructor, monitored by checkpointer and WAL writer
+- WaitGroup tracks active goroutines
+- Signal handler (main.go:100-107) cancels context, waits for WaitGroup, calls `.exit`
+
+### WAL Manager (`internal/pager/wal_manager.go`)
+
+**Channel-Based Writer** (single goroutine, lines 59-79):
+- `RequestChan`: Receives `WALRequest{Records, Done}`
+- Writer goroutine: read request → writeRecords() → Sync() → respond on Done
+- Eliminates cross-session contamination (each request batched separately)
+
+**WALRecord Format:**
+- LSN: `uint64` (byte offset in WAL file, seekable)
+- Action: `uint8` (INSERT=0, DELETE=1, UPDATE=2, VACUUM=3, CHECKPOINT=4)
+- Action-specific fields (Key, RecordBytes, RootPageID, NextPageID)
+
+**Key Methods:**
+- `NewWalManager(filename, ctx, wg)` - Start writer goroutine
+- `LogInsert/LogDelete/LogUpdate` - Send single-record request, block on response
+- `LogCheckpoint/LogVacuum` - Send metadata record
+- `ReadAll()` - Deserialize all records (for recovery)
+- `Truncate()` - Clear WAL (after checkpoint)
+- `writeRecords(records)` - Assign LSNs, serialize, write, Sync()
+
+**Recovery:** `BTreeStore.Recover()` calls `wal.ReadAll()`, replays INSERT/DELETE operations.
+
+### Schema System (`internal/schema/schema.go`)
+
+**Schema:**
+- `TableName`: string
+- `Fields`: `[]Field{Name, Type}`
+
+**FieldType:** IntType (int32), StringType, BoolType, FloatType (float64), DateType (Unix timestamp, displayed as YYYY-MM-DD)
+
+**Record:** `map[string]any`
+
+**Binary Encoding:**
+- Integers: LittleEndian uint32
+- Strings: 4-byte length prefix + UTF-8 bytes
+- Floats: `math.Float64bits` → uint64 → LittleEndian
+- Bools: Single byte (1=true, 0=false)
+- Dates: Unix timestamp as int64
+
+**Key Methods:**
+- `ParseFieldType(s)` - String to FieldType
+- `ParseValue(s, fieldType)` - User input to typed value
+- `SerializeRecord(record)` - Binary format: `[key:8][all fields...]`
+- `DeserializeRecord(data)` - Parse binary → Record
+- `ExtractPrimaryKey(record)` - Get first field as uint64 (must be int32)
+
+**Primary Key Constraint:** First field must be `int` type (int32), cast to uint64 for tree operations.
+
+### CLI Layer (`internal/cli/commands.go`)
+
+**DatabaseConfig:**
+- `TableS`: `*BTreeStore` (active table)
+- `inTransaction`: `bool`
+- `txnBuffer`: `[]pager.WALRecord`
+- `ctx`, `wg`: For graceful shutdown
+
+**Table Cache:**
+- `GetOrOpenTable(filename, ctx, wg)` - Ensures single BTreeStore instance per file (mutex-protected map)
+- Critical for BTreeStore.mu to work (all clients share same instance)
+
+**Command Implementation:**
+- All commands write to `io.Writer` (stdout or net.Conn)
+- Dynamic schema: Commands query `config.TableS.Schema().Fields` at runtime
+- Formatted output: Column-aligned tables with field names as headers
+- Transaction-aware: INSERT/DELETE check `config.inTransaction` flag
+
+**Key Patterns:**
+- VACUUM: Reloads table cache after rebuild (commands.go:223-233)
+- UPDATE: Naive DELETE + INSERT
+- .exit: TCP clients just close connection, local client checkpoints all tables
+
+### TCP Server (`cmd/main.go`)
+
+**Server Setup:**
+- Listens on port 42069
+- `handleTCPConnection()` per client
+- Each connection gets isolated `DatabaseConfig` via `Clone()` (shares TableS references)
+
+**Graceful Shutdown:**
+- Context + cancel (line 84)
+- Signal handler (lines 88-107): Ctrl+C → cancel context → wg.Wait() → .exit → os.Exit(0)
+- TCP server goroutine monitors context, closes listener on cancellation
+- WAL writer goroutine drains RequestChan on context cancellation
+
+**REPL Limitation:**
+- `bufio.Scanner.Scan()` blocks on stdin without checking context (line 39)
+- On Ctrl+C: checkpointers exit cleanly, prompt remains until Enter pressed
+- Comment at line 35-36 acknowledges this
 
 ## Key Design Decisions
 
-**Binary Encoding:**
-- All integers: LittleEndian encoding via `encoding/binary`
-- Strings: 4-byte length prefix + UTF-8 bytes
-- Floats: `math.Float64bits` converts to uint64, then LittleEndian
-- Bools: Single byte (1=true, 0=false)
-
 **Concurrency Model:**
-- Table cache in `cli` package ensures single `BTreeStore` per file
-- `sync.RWMutex` on BTreeStore serializes tree access (Insert uses Lock, Find/ScanAll use RLock)
-- B+ tree storage provides better concurrency characteristics than legacy append-only log
+- BTreeStore.mu (RWMutex): Serializes tree operations (Insert/Delete use Lock, Find/ScanAll use RLock)
+- PageCache.mu: Protects cache map and clock queue
+- Table cache mutex: Protects global tableCache map
+- WAL writer: Single goroutine, channel-based requests (no contention)
 
-**Command Processing:**
-- Commands take `io.Writer` to support both stdout (REPL) and `net.Conn` (TCP)
-- `bufio.Writer` wrapper on TCP connections requires explicit `Flush()` after each command
-- Per-session `DatabaseConfig` allows clients to switch tables independently
+**Durability Strategy:**
+- WAL syncs after every flush (wal_manager.go:101)
+- Page writes during eviction don't sync (rely on WAL)
+- Header syncs after WriteHeader (disk_manager.go:59)
+- Checkpoint: FlushAll → Sync → Truncate WAL
 
-**Schema System:**
-- Dynamic field parsing: Commands query `config.TableS.Schema().Fields` at runtime (method call, not field access)
-- Type parsing via switch statements in `schema.ParseValue`
-- Schema stored in file header (page 0), read on open (no external metadata files)
-- **Primary key constraint**: First field must be int32 type (used as uint64 key in B+ tree)
+**Transaction Isolation:**
+- No read isolation (BTreeStore.mu serializes everything)
+- Uncommitted writes not visible to other sessions (buffered in session-level txnBuffer)
+- COMMIT sends batch request to WAL writer (single fsync for entire transaction)
 
-## Important Implementation Details
+**Delete Strategy:**
+- Compact-on-delete (immediate Compact after tombstone creation)
+- Simplifies merge logic (NumSlots always = len(Records) after compact)
+- Trade-off: Delete performance for simpler correctness
 
-- Schema field order is preserved during serialization (critical for binary format consistency)
-- Float parsing in Go: `strconv.ParseFloat(s, 64)` for user input
-- Table names in prompts: Read from `BTreeStore.Schema().TableName` (file header), not filename
-- Server logs go to stderr (`log.SetOutput(os.Stderr)`) to avoid REPL interference
-- Primary key extraction: `record[firstField.Name].(int32)` type assertion, cast to uint64 for tree key
-- Stats command useful for debugging tree structure: shows root page, type (LEAF=0/INTERNAL=1), NextPageID
+**Free Page Management:**
+- Orphaned pages from merges added to FreePageIDs (btree.go:393, 430)
+- AllocatePage pops from free list before incrementing NextPageID (page_cache.go:54-64)
+- Pages evicted from cache when freed (prevents stale pointer bugs)
 
-## Current Development Status
+**Sequential Insert Optimization:**
+- Detected when `key > lastKey` in leaf (btree.go:193)
+- 70/30 split ratio instead of 50/50 (reduces future splits for monotonic workloads)
 
-B+ tree page-based storage is **completed and fully integrated** with the CLI:
+## Current State (October 2025)
 
-**Completed:**
-- ✅ Slotted page layout with serialization/deserialization
-- ✅ Binary search for sorted key insertion and lookup
-- ✅ Leaf node splits with promoted key handling
-- ✅ Internal node splits with RightmostChild pointer management
-- ✅ Page-level I/O with DiskManager
-- ✅ Table header with PageID allocation tracking
-- ✅ Comprehensive test suite for pages and splits
-- ✅ BTree orchestration with recursive insertion and split propagation
-- ✅ Root split handling (creates new root with 2 children)
-- ✅ Search implementation with tree traversal
-- ✅ Range scan with sibling pointer traversal
-- ✅ BTreeStore wrapper implementing TableStore interface
-- ✅ Full CLI integration (create, use, insert, select, stats commands)
-- ✅ Header durability fix (sync BTree changes back to DiskManager)
-- ✅ Stress testing with 150 inserts verified multi-level tree growth
+**Production-Ready Features:**
+- ✅ B+ tree with inserts, deletes, range scans
+- ✅ Page cache with Clock eviction (250 pages)
+- ✅ CRC32 checksums (page corruption detection)
+- ✅ Merge operations (leaf + internal)
+- ✅ Borrowing from right sibling (leaf + internal)
+- ✅ Free page reuse
+- ✅ VACUUM bulk loading (O(n) rebuild, ~50% space savings)
+- ✅ WAL with channel-based writer (no cross-session contamination)
+- ✅ Auto-commit and explicit transactions (BEGIN/COMMIT/ABORT)
+- ✅ Recovery (replay WAL on startup)
+- ✅ Background checkpointing (30s intervals)
+- ✅ Graceful shutdown (context + WaitGroup + signal handling)
+- ✅ Multi-client TCP server
+- ✅ Per-session transaction state
+- ✅ 5 data types (int, string, float, bool, date)
 
-**✅ DELETE & MERGE Implementation (COMPLETED)**
+**Known Limitations:**
+- Primary key must be `int` type (int32 cast to uint64)
+- No left-sibling borrowing (only right-sibling implemented)
+- No read isolation (BTreeStore.mu serializes all operations)
+- Checkpoint can fire during active transactions (adds latency but safe due to mutex)
+- REPL doesn't respect context cancellation (stdin blocks until Enter pressed)
+- UPDATE uses DELETE + INSERT pattern (not in-place)
+- No indexes beyond primary key
+- No query optimizer
+- No nested transactions or savepoints
 
-**Phase 1 - DELETE with Merge Support:**
-- ✅ Tree traversal to find key in leaf
-- ✅ Record removal with tombstone + immediate compact pattern
-- ✅ Underflow detection (`IsUnderfull()` checks if used space < PAGE_SIZE/2)
-- ✅ Leaf node merging when siblings can fit together
-- ✅ Internal node merging with separator key demotion
-- ✅ Parent pointer updates after DeleteRecord (slots shift down)
-- ✅ Recursive underflow propagation up the tree
-- ✅ Root collapse when internal root has only RightmostChild
-- ✅ Durability: `Sync()` in WritePage ensures all writes persist
-- ✅ CLI: `delete <id>`, `update <values>`, `count`, `describe`, `drop` commands
-- ✅ **Free page list**: Orphaned pages from merges added to FreePageIDs, reused on next allocatePage()
+**Stress Test Results:**
+- 10k sequential inserts: Works
+- 5k concurrent inserts (5 clients): Works
+- Concurrent inserts + deletes (chaos test): Works
+- Free page reuse verified: Works
+- Recovery after simulated crash: Works
 
-**Critical Bugs Fixed:**
-- ✅ **Parent write before recursion**: Parent updates must be persisted BEFORE recursive underflow handling, otherwise stale parent pointers point to orphaned pages
-- ✅ **Leaf write before underflow check**: Modified leaf must be written to disk BEFORE checking underflow (same pattern as parent fix)
-- ✅ **Cycle detection in RangeScan**: Detects corrupted leaf chains that visit pages twice
-- ✅ **Catastrophic durability bug**: Pages written to OS buffer but never synced. Fixed by adding `Sync()` to `WritePage()`. Caught via stress testing with 5000 concurrent inserts.
-- ✅ **8 Tombstone bugs** (NumSlots vs len(Records) confusion):
-  1. `Search` in leaf nodes - binary search breaks with tombstones (GetKey returns 0), fixed with linear scan
-  2. `DeleteRecord` bounds check - used NumSlots, fixed to use len(Records)
-  3. `RangeScan` iteration - used NumSlots, skipped high-index records, fixed to use len(Records)
-  4. `MergeLeaf` iteration - used sibling.NumSlots, orphaned records, fixed to use len(sibling.Records)
-  5. `MergeInternals` iteration - same issue, fixed to use len(sibling.Records)
-  6. `SplitLeaf` iteration - used NumSlots as index bound with tombstone array, caused nil insertions, fixed with Compact-first pattern
-  7. `SplitInternal` iteration - same issue, fixed with Compact-first pattern
-  8. `findRightSibling` deserialization - accessed childIndex+1 without tombstone check, fixed with forward scan
-- ✅ **Symptoms caught**: NextPageID burning (4829 pages for 49 records), records vanishing (103-146 missing), wrong key deletions (deleted 101-109 instead of staying)
+## Important Implementation Notes
 
-**Merge Algorithm Details:**
-- Prefers merging with left sibling (right into left) for consistency
-- Falls back to right sibling if no left sibling exists
-- Skips merge if combined size > PAGE_SIZE (accepts fragmentation, no borrowing yet)
-- **Leaf merge**: Calls Compact on both siblings first, updates NextLeaf chain (`merged.NextLeaf = orphaned.NextLeaf`), adds orphaned page to free list
-- **Internal merge**: Calls Compact on both siblings first, demotes separator key into merged node (`SerializeInternalRecord(separatorKey, leftNode.RightmostChild)`), adds orphaned page to free list
-- **Parent updates with tombstones**: After `DeleteRecord(separatorIndex)` creates tombstone, finds next non-tombstone record (separatorIndex+1, +2, etc.) to update child pointer
+- **Pin/unpin discipline:** Every `loadNode()` must have `defer bt.pc.UnPin(node.PageID)`. New pages from splits pinned via `AddNewPage`.
+- **Write-before-underflow pattern:** Modified nodes must be written to disk BEFORE checking for underflow (btree.go:608, 571).
+- **Header durability:** BTree modifies header via PageCache methods, `FlushHeader()` syncs to disk. Implemented as defer at start of Insert/Delete.
+- **Compact-on-delete simplification:** `NumSlots` always equals `len(Records)` after Delete (no tombstone tracking needed in merge logic).
+- **Table cache reload after VACUUM:** VACUUM replaces file atomically, must reload from cache to get fresh file handle.
+- **TCP cache sharing:** Global tableCache shared across connections. Clients don't close tables on disconnect (prevents breaking other sessions).
+- **Schema field order:** Preserved during serialization (critical for binary format consistency).
+- **Server logs:** Go to stderr (`log.SetOutput(os.Stderr)`) to avoid REPL interference.
+- **Date storage:** Unix timestamp (int64) for compact storage, formatted as YYYY-MM-DD on read.
 
-**Free Page List Implementation:**
-- `allocatePage()`: Pops from FreePageIDs if available, otherwise increments NextPageID
-- Merge operations append orphaned PageID to FreePageIDs
-- Serialized in TableHeader, persists across restarts
-- Protected by BTreeStore's RWMutex (no separate mutex needed)
-- **Verified**: 501 inserts after merges consumed 0 new pages (all reused from free list)
-
-**✅ PageCache Integration (COMPLETED):**
-- ✅ PageCache implementation with FIFO eviction (500 pages)
-- ✅ Pin/unpin semantics for in-use pages
-- ✅ BTree integrated with PageCache (loadNode/writeNode/Close)
-- ✅ Header management moved to PageCache
-- ✅ All 8 tombstone bugs fixed (NumSlots vs len(Records) pattern)
-- ✅ Compact-before-split pattern prevents nil record insertion
-- ✅ Linear scan for leaf Search (tombstone-safe)
-- ✅ All unit tests passing (PageCache, BTree, Page)
-- ✅ Stress testing: Chaos test shows 1,449 records across 41 pages (NextPageID=41, not 4829)
-
-**✅ VACUUM Bulk Loading (COMPLETED)**
-
-**Implementation:**
-- ✅ `buildLeafLayer()`: Scans old tree left-to-right via NextLeaf pointers, packs records into dense new leaves
-- ✅ `buildInternalLayer()`: Constructs parent layer using first key of each child as separator, RightmostChild for last pointer
-- ✅ `BulkLoad()`: Orchestrates bottom-up tree construction, writes to temp file, atomic rename, reloads cache
-- ✅ Atomic file replacement: Writes to `.db.tmp`, closes old file, renames temp to original, reopens
-- ✅ Cache invalidation: `PageCache.UpdateFile()` clears stale cache entries after file swap
-- ✅ CLI integration: `commandVacuum` always reloads table cache to ensure fresh handle after rebuild
-- ✅ Error handling: Defer cleanup pattern removes temp file if BulkLoad fails
+## Future Enhancements
 
 **Performance:**
-- 10x speed improvement over Insert-based rebuild (O(n) vs O(n log n))
-- ~50% space savings (e.g., 192 pages → 97 pages for 10k records)
-- No client reconnect required (fixed via cache reload in commandVacuum)
-
-**✅ WAL & Transactions (IN PROGRESS - NEEDS REFINEMENT)**
-
-**What's Working:**
-- ✅ WAL record format: INSERT, DELETE, UPDATE, CHECKPOINT, VACUUM with proper serialization
-- ✅ LSN as byte offset in WAL file (seekable, monotonic)
-- ✅ WAL Manager: `NewWalManager()`, `ReadAll()`, `FlushWAL()`, `Truncate()`
-- ✅ Round-trip tested: All 5 record types serialize/deserialize correctly
-- ✅ Recovery mechanism: `Recover()` replays WAL operations to restore database state
-- ✅ Background checkpointing: 30-second ticker flushes dirty pages, logs checkpoint, truncates WAL
-- ✅ Transaction commands: BEGIN, COMMIT, ABORT in CLI
-- ✅ Per-session transaction state: `inTransaction` and `txnBuffer` in DatabaseConfig
-- ✅ Atomicity demonstrated: Multiple INSERTs buffered, all applied on COMMIT, none applied on ABORT
-
-**Critical Issues to Fix (NEXT SESSION):**
-
-1. **Auto-commit broken**: INSERT/DELETE now REQUIRE BEGIN/COMMIT. Lost convenience of simple operations.
-   - Need: Support both auto-commit (INSERT without BEGIN) and explicit transactions (BEGIN...COMMIT)
-
-2. **Redundant buffering**: `PrepareInsert/PrepareDelete` call `LogInsert/LogDelete` → adds to `wal.buffer`
-   - ALSO stores in `config.txnBuffer` → operations duplicated in two places
-   - Fix: Only log to WAL on COMMIT, not during Prepare
-
-3. **WAL buffer contamination**: Multiple sessions share same `wal.buffer`
-   - If User A buffers ops, User B commits → User A's uncommitted ops get flushed
-   - Fix: Either per-session WAL buffers, or only use `config.txnBuffer` and flush on COMMIT
-
-4. **No read isolation**: Uncommitted writes from other sessions might be visible during SELECT
-   - Need: Define isolation level (READ COMMITTED? SNAPSHOT ISOLATION?)
-
-5. **Checkpoint during transaction**: Background checkpoint could fire mid-transaction
-   - Risk: Partial transaction state gets checkpointed
-   - Fix: Checkpoint should skip if any active transactions, or wait for them
-
-**Architecture Decision Needed:**
-
-**Where should transaction buffering happen?**
-- **Option A**: Session-level only (`config.txnBuffer`)
-  - PrepareInsert/PrepareDelete create WALRecord, return it
-  - DON'T call LogInsert/LogDelete (don't touch wal.buffer)
-  - On COMMIT: Loop through txnBuffer, call LogInsert/LogDelete, then FlushWAL
-  - Simple, clean separation
-
-- **Option B**: WAL Manager with transaction IDs
-  - WALManager tracks multiple transaction buffers (map[txnID][]WALRecord)
-  - More complex, but needed for advanced isolation
-
-**Recommend Option A for now** - simpler, gets transactions working correctly.
-
-**Implementation Plan (Next Session):**
-1. Remove LogInsert/LogDelete calls from PrepareInsert/PrepareDelete
-2. On COMMIT: for each record in txnBuffer, call LogInsert/LogDelete, then FlushWAL once
-3. Restore auto-commit: if !inTransaction in commandInsert/Delete, call BTreeStore.Insert/Delete directly
-4. Test: Verify auto-commit works, transactions work, no cross-contamination
-5. Address checkpoint timing (pause during active transactions)
-
-**Future Enhancements:**
-- Node borrowing/redistribution (when merge impossible due to size)
-- Async background flusher for dirty pages (reduce fsync overhead, batch writes)
-- Support non-int primary keys via hashing (currently first field must be int32)
+- Async page flusher (background goroutine, batch writes, reduce fsync overhead)
 - Group commit optimization (batch multiple transactions, single fsync)
-- MVCC for snapshot isolation
-- Page-level checksums and compression
+- Parallel B+ tree with latch crabbing (reduce mutex contention)
 
-## Current Todo List
+**Correctness:**
+- Left-sibling borrowing (currently only right-sibling)
+- Active transaction tracking (skip checkpoints when txns in progress)
+- Fix REPL context cancellation (non-blocking stdin or channel-based approach)
 
-**Transaction Fixes (Priority 1):**
-1. Remove LogInsert call from PrepareInsert in btree_store.go:282-284
-2. Remove LogDelete call from PrepareDelete in btree_store.go:295-297
-3. Update Commit() to log operations before applying them
-4. Update commandInsert to check inTransaction flag (auto-commit vs buffer)
-5. Update commandDelete to check inTransaction flag (auto-commit vs buffer)
-6. Test auto-commit mode (INSERT without BEGIN should commit immediately)
-7. Test explicit transaction mode (BEGIN, multiple ops, COMMIT)
-8. Test ABORT rollback (BEGIN, ops, ABORT should discard buffered ops)
+**Features:**
+- MVCC for snapshot isolation (multi-version concurrency control)
+- Secondary indexes (B+ tree per index, point back to primary key)
+- Support non-int primary keys (hash to uint64)
+- Query optimizer (cost-based, statistics on key distribution)
+- Savepoints and nested transactions
+- Compression (LZ4/Snappy for page-level compression)
 
-**Graceful Shutdown & Context (Priority 2):**
-9. Add graceful shutdown with context.Context and sync.WaitGroup
-10. Add on-demand checkpoint triggering via channel request/response
-11. Add signal handling in main.go for Ctrl+C graceful shutdown
-
-**Reading:** "Concurrency in Go" by Katherine Cox-Buday (ordered, arriving soon)
-
-**Next 30 Days Focus:** Go wizard path - complete transactions, add context/channels, profile & optimize, apply Cox-Buday patterns
+**Robustness:**
+- Redo-only WAL with physiological logging (currently simple redo)
+- Log-structured merge tree for write-heavy workloads
+- Online backup and point-in-time recovery
 
 ## Learning-Focused Interaction Guidelines
 
@@ -471,7 +480,7 @@ The user follows principles from Scott Young's learning framework. Apply these w
 - Create connections between concepts (WAL durability ← fsync ← page writes)
 
 **Learning Velocity Observations:**
-- User built B+ tree + WAL + transactions in 11 days
+- User built B+ tree + WAL + transactions in ~3 weeks
 - High learning velocity when in flow state
 - Prefers focused 2-4 hour sessions over extended marathons
 - Book → project → book cycle works well (Petrov → database → Bodner Context chapter)
@@ -544,24 +553,9 @@ The user has experienced unproductive loops where:
 
 The user learns best through guided exploration, not guided implementation.
 
-## Important Notes
+## References
 
-- **Primary key constraint**: First field of schema must be int32 type (cast to uint64 for B+ tree keys). Future: support arbitrary types via hashing.
-- **Free list race condition protection**: FreePageIDs has no explicit mutex, but it's safe because BTreeStore's RWMutex serializes all BTree access. Every operation that touches FreePageIDs (via pc.AllocatePage during Insert, pc.FreePage during merge in Delete) holds the write lock.
-- **PageCache concurrency**: PageCache.mu protects cache map and clock queue. BTreeStore.mu provides outer serialization for all BTree operations. Pin/unpin must be called within the same BTree operation scope.
-- **Cache size**: maxCacheSize = 200 pages. With 4KB pages, caches up to 800KB of data. Clock eviction prevents cache exhaustion during deep tree operations.
-- **Eviction and durability**: Dirty pages flushed to disk during eviction via flushRecord(). Close() flushes all remaining dirty pages. Header flushed via explicit FlushHeader() calls.
-- **Performance trade-off**: flushRecord() calls Sync() for durability during eviction. This ensures evicted pages persist, but adds latency. Future: batch writes, async flusher.
-- **Free list vs VACUUM**: Free list prevents file growth by reusing pages, but doesn't reclaim disk space. VACUUM rebuilds tree with bulk loading (O(n) sequential scan), achieving ~50% space savings and 10x performance improvement over Insert-based rebuild.
-- **Stress testing importance**: Catastrophic durability bug (100% data loss) and all 8 tombstone bugs only discovered through concurrent stress tests with restart verification and chaos testing.
-- **Tombstone model critical pattern**: `NumSlots` = active record count (decrements on delete), `len(Records)` = array size with tombstones. ALWAYS use `len(Records)` for iteration and bounds checks. Using NumSlots causes silent data loss (records at high indices skipped).
-- **Linear scan for leaf Search**: Binary search breaks with tombstones because `GetKey(mid)` returns 0 for nil records, making comparison logic incorrect. Linear scan is simple, correct, and fast enough for small leaf pages (~50-100 records).
-- **Compact-before-split**: SplitLeaf/SplitInternal must call Compact() first to ensure NumSlots == len(Records), preventing nil record insertion errors.
-- **VACUUM implementation**: Uses bulk loading (buildLeafLayer + buildInternalLayer) for O(n) rebuild. Writes to temp file, atomic rename ensures durability. commandVacuum always reloads table cache to prevent stale file handles.
-- **TCP/REPL cache sharing**: Global tableCache shared across connections. TCP clients don't close tables on disconnect (Close() commented out in commandExit) to prevent breaking other sessions.
-- **WAL transaction state (IN PROGRESS)**: Currently transactions REQUIRE BEGIN/COMMIT - auto-commit is broken. PrepareInsert/PrepareDelete call LogInsert/LogDelete creating redundant buffering. Fix needed: session-level buffering only, log to WAL on COMMIT.
-- **Transaction isolation**: Per-session transaction state in DatabaseConfig (inTransaction, txnBuffer). Multiple users can build transactions concurrently, BTreeStore.mu serializes COMMIT execution. Currently no read isolation - uncommitted writes might be visible.
-- **Background checkpointing**: 30-second ticker in BTreeStore.startCheckpointer(). Flushes all dirty pages, logs CHECKPOINT, truncates WAL. ISSUE: Can fire during active transactions - needs fix to skip or wait.
-- **WAL file format**: LSN as byte offset (seekable), records: [LSN:8][Action:1][...fields]. Recovery: ReadAll() → replay Insert/Delete operations. Checkpoint truncates entire WAL (clean slate).
-- Consider adding a JSON/HTTP endpoint for external integrations
-- Remember to refactor BulkLoad() to return a []*SlottedPage, then write a pc.ReplaceTreeFromPages(pgs []*SlottedPage) that does the disk io
+- "Database Internals" by Alex Petrov (primary resource, breadcrumb pattern, B+ tree algorithms)
+- "Introduction to Algorithms" (CLRS) - B-tree fundamentals
+- Slotted page layout (standard in PostgreSQL, SQLite, most RDBMS)
+- Clock eviction algorithm (second-chance page replacement)

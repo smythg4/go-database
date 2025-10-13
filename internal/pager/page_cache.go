@@ -8,7 +8,7 @@ import (
 	"sync"
 )
 
-const maxCacheSize = 200
+const maxCacheSize = 250
 
 type CacheRecord struct {
 	id       PageID
@@ -227,9 +227,10 @@ func (pc *PageCache) flushRecord(cr *CacheRecord) error {
 	if err := pc.writeRecord(cr); err != nil {
 		return err
 	}
-	if err := pc.dm.Sync(); err != nil {
-		return err
-	}
+	// shouldn't need to fsync on every flush now that we have WAL
+	// if err := pc.dm.Sync(); err != nil {
+	// 	return err
+	// }
 	cr.isDirty = false
 	return nil
 }

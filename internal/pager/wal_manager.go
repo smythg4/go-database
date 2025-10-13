@@ -45,6 +45,8 @@ type WALRecord struct {
 }
 
 func NewWalManager(filename string, ctx context.Context, wg *sync.WaitGroup) (*WALManager, error) {
+	// this has issues on ctrl-c termination
+
 	f, err := os.OpenFile(filename, os.O_RDWR|os.O_CREATE|os.O_APPEND, 0644)
 	if err != nil {
 		return nil, err
