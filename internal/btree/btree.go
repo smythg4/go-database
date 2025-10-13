@@ -268,7 +268,10 @@ func (bt *BTree) Search(key uint64) ([]byte, bool, error) {
 
 func (bt *BTree) RangeScan(startKey, endKey uint64) ([][]byte, error) {
 	// start at the leaf containing startKey
-	leafPageID, _ := bt.findLeaf(startKey, &BTStack{})
+	leafPageID, err := bt.findLeaf(startKey, &BTStack{})
+	if err != nil {
+		return nil, err
+	}
 
 	var results [][]byte
 	visited := make(map[pager.PageID]bool) // cycle detection
@@ -623,7 +626,11 @@ func (bt *BTree) Stats() string {
 }
 
 func (bt *BTree) Vacuum() error {
-	return bt.BulkLoad()
+	pages, rootID, err := bt.BulkLoad()
+	if err != nil {
+		return err
+	}
+	return bt.pc.ReplaceTreeFromPages(pages, rootID)
 }
 
 func (bt *BTree) oldVacuum() error {
@@ -827,11 +834,11 @@ func buildInternalLayer(children []*pager.SlottedPage) ([]*pager.SlottedPage, er
 	return parents, nil
 }
 
-func (bt *BTree) BulkLoad() error {
+func (bt *BTree) BulkLoad() ([]*pager.SlottedPage, pager.PageID, error) {
 	// phase 1: build leaves
 	leaves, err := bt.buildLeafLayer()
 	if err != nil {
-		return err
+		return nil, 0, err
 	}
 
 	// Track all pages to write
@@ -843,71 +850,14 @@ func (bt *BTree) BulkLoad() error {
 	for len(currentLayer) > 1 {
 		currentLayer, err = buildInternalLayer(currentLayer)
 		if err != nil {
-			return err
+			return nil, 0, err
 		}
 		allPages = append(allPages, currentLayer...) // add each layer
 	}
 
 	root := currentLayer[0]
 
-	// phase 3: write all pages to the new file and update header
-	tempFile := bt.pc.GetSchema().TableName + ".db.tmp"
-	f, err := os.Create(tempFile)
-	if err != nil {
-		return err
-	}
-
-	// Cleanup temp file on error
-	defer func() {
-		if err != nil {
-			f.Close()
-			os.Remove(tempFile) // Clean up if we return early with error
-		}
-	}()
-
-	tempDM := pager.NewDiskManager(f)
-
-	// create header pointing to root
-	freshHeader := pager.DefaultTableHeader(bt.pc.GetSchema())
-	freshHeader.RootPageID = root.PageID
-	freshHeader.NextPageID = pager.PageID(len(allPages) + 1)
-	freshHeader.NumPages = uint32(len(allPages))
-	tempDM.SetHeader(freshHeader)
-	if err := tempDM.WriteHeader(); err != nil {
-		return err
-	}
-
-	// write all pages
-	for _, page := range allPages {
-		if err := tempDM.WriteSlottedPage(page); err != nil {
-			return err
-		}
-	}
-
-	// sync and close temp file
-	if err := f.Sync(); err != nil {
-		return err
-	}
-	if err := f.Close(); err != nil {
-		return err
-	}
-
-	// close old file, rename, reopen
-	if err := bt.pc.Close(); err != nil {
-		return err
-	}
-
-	origFile := bt.pc.GetSchema().TableName + ".db"
-	if err := os.Rename(tempFile, origFile); err != nil {
-		return err
-	}
-
-	f, err = os.OpenFile(origFile, os.O_RDWR, 0644)
-	if err != nil {
-		return err
-	}
-
-	return bt.pc.UpdateFile(f)
+	return allPages, root.PageID, nil
 }
 
 func (bt *BTree) GetWalMetadata() (rootPageID, nextPageID uint32) {

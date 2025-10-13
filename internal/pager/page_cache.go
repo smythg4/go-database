@@ -344,3 +344,64 @@ func (pc *PageCache) Contains(id PageID) bool {
 	_, exists := pc.cache[id]
 	return exists
 }
+
+func (pc *PageCache) ReplaceTreeFromPages(pages []*SlottedPage, rootID PageID) error {
+	// phase 3: write all pages to the new file and update header
+	tempFile := pc.GetSchema().TableName + ".db.tmp"
+	f, err := os.Create(tempFile)
+	if err != nil {
+		return err
+	}
+
+	// Cleanup temp file on error
+	defer func() {
+		if err != nil {
+			f.Close()
+			os.Remove(tempFile) // Clean up if we return early with error
+		}
+	}()
+
+	tempDM := NewDiskManager(f)
+
+	// create header pointing to root
+	freshHeader := DefaultTableHeader(pc.GetSchema())
+	freshHeader.RootPageID = rootID
+	freshHeader.NextPageID = PageID(len(pages) + 1)
+	freshHeader.NumPages = uint32(len(pages))
+	tempDM.SetHeader(freshHeader)
+	if err := tempDM.WriteHeader(); err != nil {
+		return err
+	}
+
+	// write all pages
+	for _, page := range pages {
+		if err := tempDM.WriteSlottedPage(page); err != nil {
+			return err
+		}
+	}
+
+	// sync and close temp file
+	if err := f.Sync(); err != nil {
+		return err
+	}
+	if err := f.Close(); err != nil {
+		return err
+	}
+
+	// close old file, rename, reopen
+	if err := pc.Close(); err != nil {
+		return err
+	}
+
+	origFile := pc.GetSchema().TableName + ".db"
+	if err := os.Rename(tempFile, origFile); err != nil {
+		return err
+	}
+
+	f, err = os.OpenFile(origFile, os.O_RDWR, 0644)
+	if err != nil {
+		return err
+	}
+
+	return pc.UpdateFile(f)
+}

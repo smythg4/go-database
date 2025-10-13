@@ -340,6 +340,12 @@ func commandCreate(config *DatabaseConfig, params []string, w io.Writer) error {
 	if err != nil {
 		return err
 	}
+
+	// add to cache to it gets checkpointed/closed on exit
+	tableCacheMu.Lock()
+	tableCache[fName] = newTableStore
+	tableCacheMu.Unlock()
+
 	config.TableS = newTableStore
 	fmt.Fprintf(w, "New table created: %s\n", newTableStore.Schema().TableName)
 	return nil
@@ -390,14 +396,7 @@ func commandHelp(config *DatabaseConfig, params []string, w io.Writer) error {
 func commandExit(config *DatabaseConfig, params []string, w io.Writer) error {
 	fmt.Fprintln(w, "Closing Go-DB... goodbye!")
 
-	// // if the client is remote, just close the connection
-	// for name, v := range tableCache {
-	// 	fmt.Printf("DEBUG: Closing table %s\n", name)
-	// 	if err := v.Close(); err != nil {
-	// 		fmt.Printf("Error closing %s: %v\n", name, err)
-	// 		//return err
-	// 	}
-	// }
+	// if the client is remote, just close the connection
 	if conn, ok := w.(net.Conn); ok {
 		return conn.Close()
 	}
@@ -465,8 +464,11 @@ func commandUpdate(config *DatabaseConfig, params []string, w io.Writer) error {
 		}
 		record[field.Name] = value
 	}
-	firstField := config.TableS.Schema().Fields[0].Name
-	key := record[firstField].(int32)
+
+	key, err := config.TableS.ExtractPrimaryKey(record)
+	if err != nil {
+		return err
+	}
 
 	if config.inTransaction {
 		wr, err := config.TableS.PrepareInsert(record)

@@ -4,6 +4,8 @@ import (
 	"bytes"
 	"encoding/binary"
 	"errors"
+	"fmt"
+	"hash/crc32"
 )
 
 const PAGE_SIZE = 4096
@@ -41,13 +43,14 @@ type Page struct {
 func (sp *SlottedPage) GetUsedSpace() uint16 {
 	slotArraySize := 13 + (len(sp.Slots) * 4) // header + slot array
 	dataSize := 0
+	trailerSize := 4 // uint32 for checksum
 
 	for _, slot := range sp.Slots {
 		if slot.Offset > 0 { // skip tombstones
 			dataSize += int(slot.Length)
 		}
 	}
-	return uint16(slotArraySize + dataSize)
+	return uint16(slotArraySize + dataSize + trailerSize)
 }
 
 func (sp *SlottedPage) IsUnderfull() bool {
@@ -80,10 +83,25 @@ func (sp *SlottedPage) Serialize() Page {
 		}
 	}
 
+	// write checksum to trailer (bytes 4092-4096)
+	checksum := crc32.ChecksumIEEE(page.Data[0:4092])
+	binary.LittleEndian.PutUint32(page.Data[4092:4096], checksum)
+
 	return page
 }
 
 func DeserializeSlottedPage(page Page) (*SlottedPage, error) {
+	// read checksum from trailer
+	storedChecksum := binary.LittleEndian.Uint32(page.Data[4092:4096])
+
+	// calculate checksum over data portion
+	calculatedChecksum := crc32.ChecksumIEEE(page.Data[0:4092])
+
+	// verify
+	if storedChecksum != calculatedChecksum {
+		return nil, fmt.Errorf("checksum mismatch: stored=%x, calculated=%x", storedChecksum, calculatedChecksum)
+	}
+
 	sp := &SlottedPage{
 		PageID:         page.PageID,
 		PageType:       PageType(page.Data[0]),
@@ -117,7 +135,7 @@ func NewSlottedPage(pageID PageID, pageType PageType) *SlottedPage {
 		PageID:       pageID,
 		PageType:     pageType,
 		NumSlots:     0,
-		FreeSpacePtr: PAGE_SIZE,
+		FreeSpacePtr: PAGE_SIZE - 4,
 		Slots:        []Slot{},
 		Records:      [][]byte{},
 	}

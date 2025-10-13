@@ -212,6 +212,10 @@ func (bts *BTreeStore) Stats() string {
 	return bts.bt.Stats()
 }
 
+func (bts *BTreeStore) ExtractPrimaryKey(record schema.Record) (uint64, error) {
+	return bts.bt.ExtractPrimaryKey(record)
+}
+
 func (bts *BTreeStore) Recover() error {
 	records, err := bts.wal.ReadAll()
 	if err != nil {
