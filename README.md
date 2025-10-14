@@ -134,7 +134,6 @@ go test -bench=. ./internal/store/
 - UPDATE uses DELETE + INSERT pattern (not in-place)
 - No query optimizer
 - REPL doesn't respect context cancellation (prompt persists on Ctrl+C until Enter pressed)
-- Borrowing only from right sibling (left-sibling borrowing not implemented)
 
 ## Implementation Notes
 
@@ -150,7 +149,7 @@ go test -bench=. ./internal/store/
 
 **Sequential insert optimization:** Detects monotonic keys (`key > lastKey` in leaf), uses 70/30 split ratio instead of 50/50. Reduces future splits for monotonic workloads (auto-increment IDs, timestamps).
 
-**Borrowing:** When node underfull but sibling too large to merge, borrow first record from right sibling. Requires ≥3 keys in sibling and would remain ≥50% full after lending. Left-sibling borrowing not yet implemented.
+**Borrowing:** When node underfull but sibling too large to merge, borrow first record from left or right sibling. Requires ≥3 keys in sibling and would remain ≥50% full after lending.
 
 ## File Format
 
