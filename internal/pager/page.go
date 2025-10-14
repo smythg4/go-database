@@ -8,6 +8,12 @@ import (
 	"hash/crc32"
 )
 
+var (
+	ErrPageFull       = errors.New("page full")
+	ErrSlotOutOfRange = errors.New("slot out of range")
+	ErrRecordDeleted  = errors.New("record deleted")
+)
+
 const PAGE_SIZE = 4096
 
 type PageID uint32
@@ -153,7 +159,7 @@ func (sp *SlottedPage) InsertRecordSorted(data []byte) (int, error) {
 	newFreePtr := sp.FreeSpacePtr - uint16(len(data))
 
 	if newFreePtr < uint16(slotArrayEnd) {
-		return -1, errors.New("page full")
+		return -1, ErrPageFull
 	}
 
 	slot := Slot{
@@ -174,7 +180,7 @@ func (sp *SlottedPage) InsertRecord(data []byte) (int, error) {
 	newFreePtr := sp.FreeSpacePtr - uint16(len(data))
 
 	if newFreePtr < uint16(slotArrayEnd) {
-		return -1, errors.New("page full")
+		return -1, ErrPageFull
 	}
 
 	slot := Slot{
@@ -193,10 +199,10 @@ func (sp *SlottedPage) InsertRecord(data []byte) (int, error) {
 
 func (sp *SlottedPage) GetRecord(slotIndex int) ([]byte, error) {
 	if slotIndex >= int(sp.NumSlots) {
-		return nil, errors.New("slot out of range")
+		return nil, ErrSlotOutOfRange
 	}
 	if sp.Slots[slotIndex].Offset == 0 {
-		return nil, errors.New("record deleted")
+		return nil, ErrRecordDeleted
 	}
 
 	return sp.Records[slotIndex], nil
@@ -204,10 +210,10 @@ func (sp *SlottedPage) GetRecord(slotIndex int) ([]byte, error) {
 
 func (sp *SlottedPage) DeleteRecord(slotIndex int) error {
 	if slotIndex >= int(sp.NumSlots) {
-		return errors.New("slot out of range")
+		return ErrSlotOutOfRange
 	}
 	if sp.Records[slotIndex] == nil {
-		return errors.New("record already deleted")
+		return ErrRecordDeleted
 	}
 
 	sp.Slots[slotIndex].Offset = 0
@@ -313,7 +319,7 @@ func (sp *SlottedPage) Compact() error {
 	for _, record := range activeRecords {
 		_, err := sp.InsertRecord(record)
 		if err != nil {
-			return err
+			return fmt.Errorf("compact: failed to reinsert record: %w", err)
 		}
 	}
 	return nil
@@ -422,7 +428,7 @@ func (sp *SlottedPage) MergeLeaf(sibling *SlottedPage) error {
 	for i := 0; i < int(sibling.NumSlots); i++ {
 		_, err := sp.InsertRecordSorted(sibling.Records[i])
 		if err != nil {
-			return err
+			return fmt.Errorf("merge leaf: failed to insert record from sibling: %w", err)
 		}
 	}
 
@@ -445,7 +451,7 @@ func (sp *SlottedPage) MergeInternals(sibling *SlottedPage) error {
 	for i := 0; i < int(sibling.NumSlots); i++ {
 		_, err := sp.InsertRecordSorted(sibling.Records[i])
 		if err != nil {
-			return err
+			return fmt.Errorf("merge leaf: failed to insert record from sibling: %w", err)
 		}
 	}
 	// update the rightmost child to reflect the sibling's rightmostchild

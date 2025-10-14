@@ -13,6 +13,8 @@ import (
 	"strings"
 	"sync"
 	"syscall"
+
+	"golang.org/x/term"
 )
 
 func cleanInput(text string) []string {
@@ -148,5 +150,13 @@ func main() {
 		}
 	}()
 
-	RunREPL(config)
+	// Only run REPL if stdin is a TTY (interactive terminal)
+	// Use term.IsTerminal to properly detect terminals vs redirected/piped stdin
+	if term.IsTerminal(int(os.Stdin.Fd())) {
+		RunREPL(config)
+	} else {
+		log.Println("Running in background mode (no REPL), TCP server only")
+		// Block forever, letting TCP server and signal handler run
+		select {}
+	}
 }

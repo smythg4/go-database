@@ -72,7 +72,7 @@ func (pc *PageCache) AddNewPage(sp *SlottedPage) error {
 	}
 
 	if err := pc.CachePage(sp); err != nil {
-		return err
+		return fmt.Errorf("failed to cache new page %d: %w", sp.PageID, err)
 	}
 
 	// mark new page dirty and pin it
@@ -114,7 +114,7 @@ func (pc *PageCache) Fetch(id PageID) (sp *SlottedPage, err error) {
 		// retrieve page from disk
 		sp, err = pc.dm.ReadSlottedPage(id)
 		if err != nil {
-			return nil, err
+			return nil, fmt.Errorf("failed to read slotted page %d: %w", id, err)
 		}
 
 		// cache the page
@@ -197,11 +197,9 @@ func (pc *PageCache) Evict() error {
 		}
 
 		// found victim (unpinned, refBit=0)
-		fmt.Printf("DEBUG: Evicting page %d (dirty=%v) at position %d\n", id, cr.isDirty,
-			pc.clockHand)
+
 		if cr.isDirty {
 			if err := pc.flushRecord(cr); err != nil {
-				fmt.Printf("ERROR: flushRecord failed for page %d: %v\n", id, err)
 				return err
 			}
 		}
@@ -225,7 +223,7 @@ func (pc *PageCache) writeRecord(cr *CacheRecord) error {
 
 func (pc *PageCache) flushRecord(cr *CacheRecord) error {
 	if err := pc.writeRecord(cr); err != nil {
-		return err
+		return fmt.Errorf("failed to write page %d: %w", cr.id, err)
 	}
 	// shouldn't need to fsync on every flush now that we have WAL
 	// if err := pc.dm.Sync(); err != nil {
@@ -243,11 +241,11 @@ func (pc *PageCache) flushBatch(ids []PageID) error {
 			continue
 		}
 		if err := pc.writeRecord(cr); err != nil {
-			return err
+			return fmt.Errorf("failed to write page %d: %w", cr.id, err)
 		}
 	}
 	if err := pc.dm.Sync(); err != nil {
-		return err
+		return fmt.Errorf("failed to fsync: %w", err)
 	}
 	for _, id := range ids {
 		cr, exists := pc.cache[id]
@@ -262,15 +260,15 @@ func (pc *PageCache) flushBatch(ids []PageID) error {
 func (pc *PageCache) FlushAll() error {
 	for _, cr := range pc.cache {
 		if err := pc.writeRecord(cr); err != nil {
-			return err
+			return fmt.Errorf("failed to write page %d: %w", cr.id, err)
 		}
 	}
 	if err := pc.dm.Sync(); err != nil {
-		return err
+		return fmt.Errorf("failed to fsync: %w", err)
 	}
 	// also flush the header to disk
 	if err := pc.FlushHeader(); err != nil {
-		return err
+		return fmt.Errorf("failed to fsync header data: %w", err)
 	}
 	for _, cr := range pc.cache {
 		cr.isDirty = false
@@ -313,7 +311,7 @@ func (pc *PageCache) GetSchema() schema.Schema {
 func (pc *PageCache) Close() error {
 	// flush everything to the disk first
 	if err := pc.FlushAll(); err != nil {
-		return err
+		return fmt.Errorf("failed to flush pages on close: %w", err)
 	}
 	return pc.dm.Close()
 }
@@ -322,7 +320,7 @@ func (pc *PageCache) UpdateFile(file *os.File) error {
 	// switch to new file (after vacuum rename)
 	pc.dm.SetFile(file)
 	if err := pc.dm.ReadHeader(); err != nil {
-		return err
+		return fmt.Errorf("failed to read header after file update: %w", err)
 	}
 
 	// update header pointer
@@ -351,7 +349,7 @@ func (pc *PageCache) ReplaceTreeFromPages(pages []*SlottedPage, rootID PageID) e
 	tempFile := pc.GetSchema().TableName + ".db.tmp"
 	f, err := os.Create(tempFile)
 	if err != nil {
-		return err
+		return fmt.Errorf("failed to create temp file: %w", err)
 	}
 
 	// Cleanup temp file on error
@@ -371,37 +369,37 @@ func (pc *PageCache) ReplaceTreeFromPages(pages []*SlottedPage, rootID PageID) e
 	freshHeader.NumPages = uint32(len(pages))
 	tempDM.SetHeader(freshHeader)
 	if err := tempDM.WriteHeader(); err != nil {
-		return err
+		return fmt.Errorf("failed to write temp header: %w", err)
 	}
 
 	// write all pages
 	for _, page := range pages {
 		if err := tempDM.WriteSlottedPage(page); err != nil {
-			return err
+			return fmt.Errorf("failed to write page %d to temp file: %w", page.PageID, err)
 		}
 	}
 
 	// sync and close temp file
 	if err := f.Sync(); err != nil {
-		return err
+		return fmt.Errorf("failed to fsync temp file: %w", err)
 	}
 	if err := f.Close(); err != nil {
-		return err
+		return fmt.Errorf("failed to close temp file: %w", err)
 	}
 
 	// close old file, rename, reopen
 	if err := pc.Close(); err != nil {
-		return err
+		return fmt.Errorf("failed to close old file before rename: %w", err)
 	}
 
 	origFile := pc.GetSchema().TableName + ".db"
 	if err := os.Rename(tempFile, origFile); err != nil {
-		return err
+		return fmt.Errorf("failed to rename temp file to original file: %w", err)
 	}
 
 	f, err = os.OpenFile(origFile, os.O_RDWR, 0644)
 	if err != nil {
-		return err
+		return fmt.Errorf("failed to reopen file after rename: %w", err)
 	}
 
 	return pc.UpdateFile(f)

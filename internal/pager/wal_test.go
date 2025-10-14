@@ -9,11 +9,11 @@ import (
 func TestSerializeDeserializeInsert(t *testing.T) {
 	// Create a WAL record
 	original := &WALRecord{
-		lsn:          LSN(12345),
-		action:       INSERT,
-		key:          WalKey(100),
-		recordLength: 10,
-		recordBytes:  []byte("test data!"),
+		Lsn:          LSN(12345),
+		Action:       INSERT,
+		Key:          WalKey(100),
+		RecordLength: 10,
+		RecordBytes:  []byte("test data!"),
 	}
 
 	// Serialize it
@@ -35,28 +35,28 @@ func TestSerializeDeserializeInsert(t *testing.T) {
 	}
 
 	// Verify round-trip
-	if result.lsn != original.lsn {
-		t.Errorf("LSN mismatch: got %d, want %d", result.lsn, original.lsn)
+	if result.Lsn != original.Lsn {
+		t.Errorf("LSN mismatch: got %d, want %d", result.Lsn, original.Lsn)
 	}
-	if result.action != original.action {
-		t.Errorf("Action mismatch: got %d, want %d", result.action, original.action)
+	if result.Action != original.Action {
+		t.Errorf("Action mismatch: got %d, want %d", result.Action, original.Action)
 	}
-	if result.key != original.key {
-		t.Errorf("Key mismatch: got %d, want %d", result.key, original.key)
+	if result.Key != original.Key {
+		t.Errorf("Key mismatch: got %d, want %d", result.Key, original.Key)
 	}
-	if !bytes.Equal(result.recordBytes, original.recordBytes) {
-		t.Errorf("RecordBytes mismatch: got %v, want %v", result.recordBytes, original.recordBytes)
+	if !bytes.Equal(result.RecordBytes, original.RecordBytes) {
+		t.Errorf("RecordBytes mismatch: got %v, want %v", result.RecordBytes, original.RecordBytes)
 	}
 }
 
 func TestSerializeDeserializeUpdate(t *testing.T) {
 	// Create a WAL record
 	original := &WALRecord{
-		lsn:          LSN(12345),
-		action:       UPDATE,
-		key:          WalKey(100),
-		recordLength: 10,
-		recordBytes:  []byte("test data!"),
+		Lsn:          LSN(12345),
+		Action:       UPDATE,
+		Key:          WalKey(100),
+		RecordLength: 10,
+		RecordBytes:  []byte("test data!"),
 	}
 
 	// Serialize it
@@ -78,26 +78,26 @@ func TestSerializeDeserializeUpdate(t *testing.T) {
 	}
 
 	// Verify round-trip
-	if result.lsn != original.lsn {
-		t.Errorf("LSN mismatch: got %d, want %d", result.lsn, original.lsn)
+	if result.Lsn != original.Lsn {
+		t.Errorf("LSN mismatch: got %d, want %d", result.Lsn, original.Lsn)
 	}
-	if result.action != original.action {
-		t.Errorf("Action mismatch: got %d, want %d", result.action, original.action)
+	if result.Action != original.Action {
+		t.Errorf("Action mismatch: got %d, want %d", result.Action, original.Action)
 	}
-	if result.key != original.key {
-		t.Errorf("Key mismatch: got %d, want %d", result.key, original.key)
+	if result.Key != original.Key {
+		t.Errorf("Key mismatch: got %d, want %d", result.Key, original.Key)
 	}
-	if !bytes.Equal(result.recordBytes, original.recordBytes) {
-		t.Errorf("RecordBytes mismatch: got %v, want %v", result.recordBytes, original.recordBytes)
+	if !bytes.Equal(result.RecordBytes, original.RecordBytes) {
+		t.Errorf("RecordBytes mismatch: got %v, want %v", result.RecordBytes, original.RecordBytes)
 	}
 }
 
 func TestSerializeDeserializeDelete(t *testing.T) {
 	// Create a WAL record
 	original := &WALRecord{
-		lsn:    LSN(12345),
-		action: DELETE,
-		key:    WalKey(100),
+		Lsn:    LSN(12345),
+		Action: DELETE,
+		Key:    WalKey(100),
 	}
 
 	// Serialize it
@@ -119,24 +119,24 @@ func TestSerializeDeserializeDelete(t *testing.T) {
 	}
 
 	// Verify round-trip
-	if result.lsn != original.lsn {
-		t.Errorf("LSN mismatch: got %d, want %d", result.lsn, original.lsn)
+	if result.Lsn != original.Lsn {
+		t.Errorf("LSN mismatch: got %d, want %d", result.Lsn, original.Lsn)
 	}
-	if result.action != original.action {
-		t.Errorf("Action mismatch: got %d, want %d", result.action, original.action)
+	if result.Action != original.Action {
+		t.Errorf("Action mismatch: got %d, want %d", result.Action, original.Action)
 	}
-	if result.key != original.key {
-		t.Errorf("Key mismatch: got %d, want %d", result.key, original.key)
+	if result.Key != original.Key {
+		t.Errorf("Key mismatch: got %d, want %d", result.Key, original.Key)
 	}
 }
 
 func TestSerializeDeserializeCheckpoint(t *testing.T) {
 	// Create a WAL record
 	original := &WALRecord{
-		lsn:        LSN(12345),
-		action:     CHECKPOINT,
-		rootPageID: 1,
-		nextPageID: 2,
+		Lsn:        LSN(12345),
+		Action:     CHECKPOINT,
+		RootPageID: 1,
+		NextPageID: 2,
 	}
 
 	// Serialize it
@@ -158,27 +158,27 @@ func TestSerializeDeserializeCheckpoint(t *testing.T) {
 	}
 
 	// Verify round-trip
-	if result.lsn != original.lsn {
-		t.Errorf("LSN mismatch: got %d, want %d", result.lsn, original.lsn)
+	if result.Lsn != original.Lsn {
+		t.Errorf("LSN mismatch: got %d, want %d", result.Lsn, original.Lsn)
 	}
-	if result.action != original.action {
-		t.Errorf("Action mismatch: got %d, want %d", result.action, original.action)
+	if result.Action != original.Action {
+		t.Errorf("Action mismatch: got %d, want %d", result.Action, original.Action)
 	}
-	if result.rootPageID != original.rootPageID {
-		t.Errorf("rootPageID mismatch: got %d, want %d", result.rootPageID, original.rootPageID)
+	if result.RootPageID != original.RootPageID {
+		t.Errorf("rootPageID mismatch: got %d, want %d", result.RootPageID, original.RootPageID)
 	}
-	if result.nextPageID != original.nextPageID {
-		t.Errorf("nextPageID mismatch: got %d, want %d", result.nextPageID, original.nextPageID)
+	if result.NextPageID != original.NextPageID {
+		t.Errorf("nextPageID mismatch: got %d, want %d", result.NextPageID, original.NextPageID)
 	}
 }
 
 func TestSerializeDeserializeVacuum(t *testing.T) {
 	// Create a WAL record
 	original := &WALRecord{
-		lsn:        LSN(12345),
-		action:     CHECKPOINT,
-		rootPageID: 1,
-		nextPageID: 2,
+		Lsn:        LSN(12345),
+		Action:     CHECKPOINT,
+		RootPageID: 1,
+		NextPageID: 2,
 	}
 
 	// Serialize it
@@ -200,16 +200,16 @@ func TestSerializeDeserializeVacuum(t *testing.T) {
 	}
 
 	// Verify round-trip
-	if result.lsn != original.lsn {
-		t.Errorf("LSN mismatch: got %d, want %d", result.lsn, original.lsn)
+	if result.Lsn != original.Lsn {
+		t.Errorf("LSN mismatch: got %d, want %d", result.Lsn, original.Lsn)
 	}
-	if result.action != original.action {
-		t.Errorf("Action mismatch: got %d, want %d", result.action, original.action)
+	if result.Action != original.Action {
+		t.Errorf("Action mismatch: got %d, want %d", result.Action, original.Action)
 	}
-	if result.rootPageID != original.rootPageID {
-		t.Errorf("rootPageID mismatch: got %d, want %d", result.rootPageID, original.rootPageID)
+	if result.RootPageID != original.RootPageID {
+		t.Errorf("rootPageID mismatch: got %d, want %d", result.RootPageID, original.RootPageID)
 	}
-	if result.nextPageID != original.nextPageID {
-		t.Errorf("nextPageID mismatch: got %d, want %d", result.nextPageID, original.nextPageID)
+	if result.NextPageID != original.NextPageID {
+		t.Errorf("nextPageID mismatch: got %d, want %d", result.NextPageID, original.NextPageID)
 	}
 }

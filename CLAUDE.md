@@ -32,8 +32,11 @@ go test -v -run TestInsertWithRootSplit ./internal/btree/
 # Benchmarks
 go test -bench=. -benchmem ./internal/store/
 
-# Stress tests (require running server)
-./test_chaos.sh            # concurrent inserts + deletes
+# Integration tests (require running server in background)
+./test_wal_simple.sh       # simple WAL recovery (3 records, crash, verify)
+./test_recovery.sh         # comprehensive: transactions, crash, recovery, checkpoint
+./test_crud.sh             # full CRUD operations
+./test_chaos.sh            # concurrent inserts + deletes (5 clients)
 ./test_reuse.sh            # free page reuse verification
 ./stress_test.sh           # 10k sequential inserts
 
@@ -403,12 +406,15 @@ Wrapper providing transaction support and WAL integration:
 - No query optimizer
 - No nested transactions or savepoints
 
-**Stress Test Results:**
-- 10k sequential inserts: Works
-- 5k concurrent inserts (5 clients): Works
-- Concurrent inserts + deletes (chaos test): Works
-- Free page reuse verified: Works
-- Recovery after simulated crash: Works
+**Test Results:**
+- 10k sequential inserts: ✅ Works
+- 5k concurrent inserts (5 clients): ✅ Works
+- Concurrent inserts + deletes (chaos test): ✅ Works
+- Free page reuse verified: ✅ Works
+- WAL recovery after simulated crash: ✅ Works
+- Transaction COMMIT/ABORT: ✅ Works
+- Background checkpoint (30s interval): ✅ Works
+- All test scripts work on macOS: ✅ Fixed (netcat compatibility, server TTY detection)
 
 ## Important Implementation Notes
 
@@ -416,11 +422,32 @@ Wrapper providing transaction support and WAL integration:
 - **Write-before-underflow pattern:** Modified nodes must be written to disk BEFORE checking for underflow (btree.go:608, 571).
 - **Header durability:** BTree modifies header via PageCache methods, `FlushHeader()` syncs to disk. Implemented as defer at start of Insert/Delete.
 - **Compact-on-delete simplification:** `NumSlots` always equals `len(Records)` after Delete (no tombstone tracking needed in merge logic).
+- **WAL recovery EOF handling:** Must use `errors.Is(err, io.EOF)` not `err == io.EOF` because `encoding.ReadInt64()` wraps EOF as `fmt.Errorf("failed to read int64: %w", err)`. Direct comparison fails, causing recovery to incorrectly report empty WAL despite data on disk (wal_manager.go:126, btree_store.go:242).
 - **Table cache reload after VACUUM:** VACUUM replaces file atomically, must reload from cache to get fresh file handle.
 - **TCP cache sharing:** Global tableCache shared across connections. Clients don't close tables on disconnect (prevents breaking other sessions).
 - **Schema field order:** Preserved during serialization (critical for binary format consistency).
 - **Server logs:** Go to stderr (`log.SetOutput(os.Stderr)`) to avoid REPL interference.
 - **Date storage:** Unix timestamp (int64) for compact storage, formatted as YYYY-MM-DD on read.
+
+## Recent Development (October 2025)
+
+**Session: WAL Recovery & Test Infrastructure**
+
+Fixed critical WAL recovery bug and established comprehensive test suite:
+
+**Bug Fixed:**
+- **WAL recovery returning empty despite data on disk** - Root cause: `encoding.ReadInt64()` wraps `io.EOF` errors as `fmt.Errorf("failed to read int64: %w", err)`, causing direct comparison `err == io.EOF` to fail. Solution: Use `errors.Is(err, io.EOF)` to properly unwrap and check underlying error. Files affected: `wal_manager.go:126`, `btree_store.go:242`.
+
+**Test Infrastructure:**
+- Fixed macOS netcat compatibility issues (BSD netcat doesn't support `-N` flag, now uses `.exit` pattern)
+- Fixed server infinite loop when backgrounded (used `term.IsTerminal()` instead of `os.ModeCharDevice` check)
+- Created comprehensive test suite: `test_wal_simple.sh`, `test_recovery.sh`, `test_crud.sh`
+- All integration tests now work reliably on macOS
+
+**Verification:**
+- Manual test: 3 records inserted → server killed with `kill -9` → recovery replayed 3 records ✅
+- Log output: "WAL recovery: Found 3 records to replay" ✅
+- All records successfully recovered (alice, bob, charlie) ✅
 
 ## Future Enhancements
 

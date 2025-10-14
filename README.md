@@ -114,9 +114,11 @@ internal/schema/         - Schema and serialization
 go test ./...
 go test -v ./internal/btree/
 
-# Integration tests (require running server)
-./test_chaos.sh         # Concurrent inserts/deletes (5 clients)
-./test_reuse.sh         # Free page reuse verification
+# Integration tests (require running server in background)
+./test_wal_simple.sh    # Simple WAL recovery test (3 records, crash, verify)
+./test_recovery.sh      # Comprehensive: transactions, crash, recovery, checkpoint
+./test_crud.sh          # Full CRUD operations (create, insert, select, update, delete)
+./test_chaos.sh         # Concurrent inserts/deletes (5 clients, tests free list)
 ./stress_test.sh        # 10k sequential inserts
 
 # Benchmarks

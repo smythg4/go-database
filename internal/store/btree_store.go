@@ -2,10 +2,12 @@ package store
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"godb/internal/btree"
 	"godb/internal/pager"
 	"godb/internal/schema"
+	"io"
 	"log"
 	"math"
 	"os"
@@ -62,6 +64,12 @@ func NewBTreeStore(filename string, ctx context.Context, wg *sync.WaitGroup) (*B
 	header := dm.GetHeader()
 	bt := btree.NewBTree(dm, header)
 	bts := &BTreeStore{bt: bt, wal: wm, ctx: ctx, wg: wg}
+
+	// Replay WAL to recover any uncommitted operations
+	if err := bts.Recover(); err != nil {
+		return nil, fmt.Errorf("failed to recover from WAL: %w", err)
+	}
+
 	wg.Add(1)
 	go bts.startCheckpointer()
 	return bts, nil
@@ -95,6 +103,12 @@ func CreateBTreeStore(filename string, sch schema.Schema, ctx context.Context, w
 	header := dm.GetHeader()
 	bt := btree.NewBTree(dm, header)
 	bts := &BTreeStore{bt: bt, wal: wm, ctx: ctx, wg: wg}
+
+	// Replay WAL to recover any uncommitted operations (if WAL exists)
+	if err := bts.Recover(); err != nil {
+		return nil, fmt.Errorf("failed to recover from WAL: %w", err)
+	}
+
 	wg.Add(1)
 	go bts.startCheckpointer()
 	return bts, nil
@@ -127,16 +141,16 @@ func (bts *BTreeStore) Insert(record schema.Record) error {
 
 	key, err := bts.bt.ExtractPrimaryKey(record)
 	if err != nil {
-		return err
+		return fmt.Errorf("insert: failed to extract primary key from table '%s': %w", bts.Schema().TableName, err)
 	}
 
 	data, err := bts.bt.SerializeRecord(record)
 	if err != nil {
-		return err
+		return fmt.Errorf("insert: failed to serialize record: %w", err)
 	}
 
 	if err := bts.LogInsert(key, data); err != nil {
-		return err
+		return fmt.Errorf("insert: failed to log WAL insert: %w", err)
 	}
 
 	// CRASH HERE: WAL written, but tree not modified
@@ -152,7 +166,7 @@ func (bts *BTreeStore) Delete(key uint64) error {
 	bts.mu.Lock()
 	defer bts.mu.Unlock()
 	if err := bts.LogDelete(key); err != nil {
-		return err
+		return fmt.Errorf("delete: failed to log WAL delete: %w", err)
 	}
 	return bts.bt.Delete(key)
 }
@@ -198,7 +212,7 @@ func (bts *BTreeStore) RangeScan(startKey, endKey uint64) ([]schema.Record, erro
 
 func (bts *BTreeStore) Vacuum() error {
 	if err := bts.LogVacuum(); err != nil {
-		return err
+		return fmt.Errorf("vacuum: failed to log WAL vacuum: %w", err)
 	}
 	return bts.bt.Vacuum()
 }
@@ -225,18 +239,30 @@ func (bts *BTreeStore) ExtractPrimaryKey(record schema.Record) (uint64, error) {
 func (bts *BTreeStore) Recover() error {
 	records, err := bts.wal.ReadAll()
 	if err != nil {
-		return err
+		// If WAL is empty or doesn't exist, nothing to recover
+		if errors.Is(err, io.EOF) {
+			log.Printf("WAL recovery: WAL file is empty or doesn't exist (EOF)")
+			return nil
+		}
+		return fmt.Errorf("recovery: failed to read WAL: %w", err)
 	}
 
+	// No records to recover
+	if len(records) == 0 {
+		log.Printf("WAL recovery: No records found in WAL")
+		return nil
+	}
+
+	log.Printf("WAL recovery: Found %d records to replay", len(records))
 	for _, record := range records {
 		switch record.Action {
 		case pager.INSERT:
 			if err := bts.bt.Insert(uint64(record.Key), record.RecordBytes); err != nil {
-				return err
+				return fmt.Errorf("recovery: failed to replay INSERT for key %d: %w", record.Key, err)
 			}
 		case pager.DELETE:
 			if err := bts.bt.Delete(uint64(record.Key)); err != nil {
-				return err
+				return fmt.Errorf("recovery: failed to replay DELETE for key %d: %w", record.Key, err)
 			}
 		default:
 			return fmt.Errorf("unsupported action: %v", record.Action)
@@ -251,12 +277,12 @@ func (bts *BTreeStore) Checkpoint() error {
 
 	// Write checkpoint START marker
 	if err := bts.LogCheckpoint(); err != nil {
-		return err
+		return fmt.Errorf("checkpoint: failed to log checkpoint in WAL: %w", err)
 	}
 
 	// Flush pages
 	if err := bts.bt.Checkpoint(); err != nil {
-		return err
+		return fmt.Errorf("checkpoint: failed to flush pages: %w", err)
 	}
 
 	// Sync to ensure pages are durable
@@ -272,7 +298,7 @@ func (bts *BTreeStore) Commit(txnBuffer []pager.WALRecord) error {
 		Done:    done,
 	}
 	if err := <-done; err != nil {
-		return err
+		return fmt.Errorf("commit - received error from wal buffer: %w", err)
 	}
 
 	// 3. now apply all operations to the tree
@@ -280,19 +306,19 @@ func (bts *BTreeStore) Commit(txnBuffer []pager.WALRecord) error {
 		switch record.Action {
 		case pager.INSERT:
 			if err := bts.bt.Insert(uint64(record.Key), record.RecordBytes); err != nil {
-				return err
+				return fmt.Errorf("commit: failed to INSERT key %d: %w", record.Key, err)
 			}
 		case pager.DELETE:
 			if err := bts.bt.Delete(uint64(record.Key)); err != nil {
-				return err
+				return fmt.Errorf("commit: failed to DELETE key %d: %w", record.Key, err)
 			}
 		case pager.CHECKPOINT:
 			if err := bts.bt.Checkpoint(); err != nil {
-				return err
+				return fmt.Errorf("commit: failed to log checkpoint in WAL: %w", err)
 			}
 		case pager.VACUUM:
 			if err := bts.bt.Vacuum(); err != nil {
-				return err
+				return fmt.Errorf("commit: failed to VACUUM: %w", err)
 			}
 		default:
 			return fmt.Errorf("unsupported action: %v", record.Action)
@@ -304,12 +330,12 @@ func (bts *BTreeStore) Commit(txnBuffer []pager.WALRecord) error {
 func (bts *BTreeStore) PrepareInsert(record schema.Record) (pager.WALRecord, error) {
 	key, err := bts.bt.ExtractPrimaryKey(record)
 	if err != nil {
-		return pager.WALRecord{}, err
+		return pager.WALRecord{}, fmt.Errorf("failed to extract primary key for table '%s': %w", bts.Schema().TableName, err)
 	}
 
 	data, err := bts.bt.SerializeRecord(record)
 	if err != nil {
-		return pager.WALRecord{}, err
+		return pager.WALRecord{}, fmt.Errorf("failed to serialized record: %w", err)
 	}
 
 	return pager.WALRecord{
@@ -331,7 +357,7 @@ func (bts *BTreeStore) PrepareDelete(key uint64) (pager.WALRecord, error) {
 func (bts *BTreeStore) LogCheckpoint() error {
 	rpi, npi := bts.bt.GetWalMetadata()
 	if err := bts.wal.LogCheckpoint(rpi, npi); err != nil {
-		return err
+		return fmt.Errorf("failed to log WAL checkpoint: %w", err)
 	}
 	return nil
 }
@@ -339,28 +365,28 @@ func (bts *BTreeStore) LogCheckpoint() error {
 func (bts *BTreeStore) LogVacuum() error {
 	rpi, npi := bts.bt.GetWalMetadata()
 	if err := bts.wal.LogVacuum(rpi, npi); err != nil {
-		return err
+		return fmt.Errorf("failed to log WAL vacuum: %w", err)
 	}
 	return nil
 }
 
 func (bts *BTreeStore) LogInsert(key uint64, recordBytes []byte) error {
 	if err := bts.wal.LogInsert(key, recordBytes); err != nil {
-		return err
+		return fmt.Errorf("failed to log WAL insert: %w", err)
 	}
 	return nil
 }
 
 func (bts *BTreeStore) LogDelete(key uint64) error {
 	if err := bts.wal.LogDelete(key); err != nil {
-		return err
+		return fmt.Errorf("failed to log WAL delete: %w", err)
 	}
 	return nil
 }
 
 func (bts *BTreeStore) LogUpdate(key uint64, recordBytes []byte) error {
 	if err := bts.wal.LogUpdate(key, recordBytes); err != nil {
-		return err
+		return fmt.Errorf("failed to log WAL update: %w", err)
 	}
 	return nil
 }

@@ -297,37 +297,41 @@ func TestPageDelete(t *testing.T) {
 		page.InsertRecord(data)
 	}
 
-	// Delete middle record
+	// Delete middle record (index 1 = "second")
 	err := page.DeleteRecord(1)
 	if err != nil {
 		t.Fatalf("DeleteRecord failed: %v", err)
 	}
 
-	// Try to get deleted record
-	_, err = page.GetRecord(1)
-	if err == nil {
-		t.Error("Expected error when getting deleted record")
-	}
-
-	// Compact page
-	page.Compact()
-
-	// After compaction, should have 2 records
+	// After delete+compact, should have 2 records
+	// DeleteRecord calls Compact() automatically, so records shift immediately
 	if page.NumSlots != 2 {
-		t.Errorf("After compaction, expected 2 slots, got %d", page.NumSlots)
+		t.Errorf("After delete, expected 2 slots, got %d", page.NumSlots)
 	}
 
-	// Verify remaining records
-	data0, _ := page.GetRecord(0)
+	// Verify remaining records (first and third)
+	data0, err := page.GetRecord(0)
+	if err != nil {
+		t.Fatalf("GetRecord(0) failed: %v", err)
+	}
 	_, rec0, _ := sch.DeserializeRecord(data0)
 	if rec0["value"] != "first" {
-		t.Errorf("Record 0 mismatch after compaction")
+		t.Errorf("Record 0 should be 'first', got %v", rec0["value"])
 	}
 
-	data1, _ := page.GetRecord(1)
+	data1, err := page.GetRecord(1)
+	if err != nil {
+		t.Fatalf("GetRecord(1) failed: %v", err)
+	}
 	_, rec1, _ := sch.DeserializeRecord(data1)
 	if rec1["value"] != "third" {
-		t.Errorf("Record 1 mismatch after compaction")
+		t.Errorf("Record 1 should be 'third' (shifted down after delete), got %v", rec1["value"])
+	}
+
+	// Trying to access index 2 should fail (out of range)
+	_, err = page.GetRecord(2)
+	if err == nil {
+		t.Error("Expected error when accessing out of range index 2")
 	}
 }
 
@@ -418,7 +422,7 @@ func TestLeafSplit(t *testing.T) {
 		}
 	}
 
-	newPage, promotedKey, err := page.SplitLeaf(2)
+	newPage, promotedKey, err := page.SplitLeaf(2, false)
 	if err != nil {
 		t.Fatalf("SplitLeaf failed: %v", err)
 	}
@@ -468,7 +472,7 @@ func TestInternalSplit(t *testing.T) {
 		}
 	}
 
-	newPage, promotedKey, err := page.SplitInternal(2)
+	newPage, promotedKey, err := page.SplitInternal(2, false)
 	if err != nil {
 		t.Fatalf("SplitInternal failed: %v", err)
 	}
@@ -539,16 +543,17 @@ func TestFragmentedMerge(t *testing.T) {
 		rightPage.InsertRecordSorted(data)
 	}
 
-	// Delete some records to create tombstones (fragmentation)
-	leftPage.DeleteRecord(1)  // Delete id=20
-	leftPage.DeleteRecord(2)  // Delete id=30 (was at index 3, now at 2 after first delete shifts)
+	// Delete some records to reduce left page size
+	// DeleteRecord calls Compact() automatically, so no tombstones remain
+	leftPage.DeleteRecord(1) // Delete id=20 (index 1)
+	leftPage.DeleteRecord(1) // Delete id=30 (now at index 1 after previous delete shifted)
 
-	// Check fragmentation: NumSlots decreased, but len(Slots) still has tombstones
+	// After DeleteRecord+Compact, NumSlots == len(Slots) == len(Records)
 	if leftPage.NumSlots != 3 {
 		t.Errorf("Expected 3 active slots after deletes, got %d", leftPage.NumSlots)
 	}
-	if len(leftPage.Slots) != 5 {
-		t.Errorf("Expected 5 total slots (including tombstones), got %d", len(leftPage.Slots))
+	if len(leftPage.Slots) != 3 {
+		t.Errorf("Expected 3 total slots (no tombstones after compact), got %d", len(leftPage.Slots))
 	}
 
 	// Check that pages can merge
@@ -556,8 +561,8 @@ func TestFragmentedMerge(t *testing.T) {
 		t.Fatal("Pages should be able to merge")
 	}
 
-	// Record keys before merge
-	expectedKeys := []uint64{10, 40, 50, 60, 70, 80} // 3 from left (20,30 deleted) + 3 from right
+	// Record keys before merge: 10, 40, 50 from left (20,30 deleted) + 60, 70, 80 from right
+	expectedKeys := []uint64{10, 40, 50, 60, 70, 80}
 
 	// Merge right into left
 	err := leftPage.MergeLeaf(rightPage)
@@ -570,7 +575,7 @@ func TestFragmentedMerge(t *testing.T) {
 		t.Errorf("Expected 6 active slots after merge, got %d", leftPage.NumSlots)
 	}
 
-	// Should have no tombstones (compact was called during merge)
+	// Should have no tombstones
 	if len(leftPage.Slots) != 6 {
 		t.Errorf("Expected 6 total slots (no tombstones), got %d", len(leftPage.Slots))
 	}
@@ -583,7 +588,7 @@ func TestFragmentedMerge(t *testing.T) {
 		}
 	}
 
-	// Verify all records are accessible (no tombstones)
+	// Verify all records are accessible
 	for i := 0; i < int(leftPage.NumSlots); i++ {
 		_, err := leftPage.GetRecord(i)
 		if err != nil {

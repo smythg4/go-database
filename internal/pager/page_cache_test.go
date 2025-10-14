@@ -3,6 +3,7 @@ package pager
 import (
 	"godb/internal/schema"
 	"os"
+	"strings"
 	"testing"
 )
 
@@ -49,11 +50,16 @@ func createTestPageCache(t *testing.T) (*PageCache, *DiskManager, string) {
 	dm.SetHeader(header)
 	dm.WriteHeader()
 
-	// Write some test pages to disk
-	for i := 1; i <= 60; i++ {
+	// Write enough test pages to disk to support all tests
+	// Some tests need maxCacheSize + 1 pages available
+	numPages := maxCacheSize + 10
+	for i := 1; i <= numPages; i++ {
 		page := createTestPage(PageID(i), LEAF)
 		dm.WriteSlottedPage(page)
 	}
+
+	// Update header to reflect the pages we wrote
+	header.NextPageID = PageID(numPages + 1)
 
 	pc := NewPageCache(dm, &header)
 
@@ -402,8 +408,8 @@ func TestAllPagesPinnedEvictionFails(t *testing.T) {
 	pc, _, filename := createTestPageCache(t)
 	defer cleanupTestFile(filename)
 
-	// Fill cache and keep all pages pinned (test setup only has 60 pages on disk)
-	available := 60
+	// Fill cache and keep all pages pinned
+	available := maxCacheSize
 	for i := 1; i <= available; i++ {
 		pc.Fetch(PageID(i))
 		// Don't unpin - simulate defer-in-loop accumulation
@@ -434,17 +440,15 @@ func TestAllPagesPinnedEvictionFails(t *testing.T) {
 	sp := NewSlottedPage(pageID, LEAF)
 	err := pc.AddNewPage(sp)
 
-	// If cache is full of pinned pages, this should fail
-	// (but only if cache < 60, otherwise there's room)
-	if len(pc.cache) >= maxCacheSize {
-		if err == nil {
-			t.Error("Expected error when cache full and all pinned, got nil")
-		}
-		if err.Error() != "all pages pinned" && err.Error() != "unable to evict cache to make room" {
-			t.Errorf("Unexpected error: %v", err)
-		}
-	} else {
-		t.Logf("Cache not full (%d < %d), AddNewPage succeeded", len(pc.cache), maxCacheSize)
+	// Cache is full of pinned pages, so this should fail
+	if err == nil {
+		t.Error("Expected error when cache full and all pinned, got nil")
+	}
+
+	// Check that error mentions pinned pages (may be wrapped)
+	errMsg := err.Error()
+	if !strings.Contains(errMsg, "all pages pinned") {
+		t.Errorf("Expected error about pinned pages, got: %v", err)
 	}
 }
 
@@ -487,8 +491,9 @@ func TestBulkFetchesWithImmediateUnpin(t *testing.T) {
 
 	// Fetch more pages than cache capacity, but unpin immediately
 	iterations := maxCacheSize * 3
+	numTestPages := maxCacheSize + 10 // Must match createTestPageCache
 	for i := 1; i <= iterations; i++ {
-		pageID := PageID((i % 60) + 1) // Cycle through 60 pages
+		pageID := PageID((i % numTestPages) + 1) // Cycle through available test pages
 		_, err := pc.Fetch(pageID)
 		if err != nil {
 			t.Fatalf("Fetch failed at iteration %d: %v", i, err)

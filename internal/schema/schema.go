@@ -227,12 +227,17 @@ func writeFieldValue(w io.Writer, fieldType FieldType, value any) error {
 		return encoding.WriteString(w, s)
 	case BoolType:
 		b := value.(bool)
+		var byt byte
 		if b {
-			_, err := w.Write([]byte{1})
-			return err
+			byt = 1
+		} else {
+			byt = 0
 		}
-		_, err := w.Write([]byte{0})
-		return err
+		_, err := w.Write([]byte{byt})
+		if err != nil {
+			return fmt.Errorf("schema: failed to write bool value: %w", err)
+		}
+		return nil
 	case FloatType:
 		f := value.(float64)
 		return encoding.WriteFloat64(w, f)

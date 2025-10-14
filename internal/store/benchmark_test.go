@@ -1,9 +1,11 @@
 package store
 
 import (
+	"context"
 	"fmt"
 	"godb/internal/schema"
 	"os"
+	"sync"
 	"testing"
 )
 
@@ -62,7 +64,7 @@ func benchBTreeInsert(b *testing.B, n int) {
 		filename := fmt.Sprintf("/tmp/bench_btree_insert_%d.db", i)
 		defer os.Remove(filename)
 
-		store, err := CreateBTreeStore(filename, benchSchema())
+		store, err := CreateBTreeStore(filename, benchSchema(), context.Background(), &sync.WaitGroup{})
 		if err != nil {
 			b.Fatal(err)
 		}
@@ -132,7 +134,7 @@ func benchBTreeFind(b *testing.B, n int) {
 	filename := "/tmp/bench_btree_find.db"
 	defer os.Remove(filename)
 
-	store, err := CreateBTreeStore(filename, benchSchema())
+	store, err := CreateBTreeStore(filename, benchSchema(), context.Background(), &sync.WaitGroup{})
 	if err != nil {
 		b.Fatal(err)
 	}
@@ -214,7 +216,7 @@ func benchBTreeScanAll(b *testing.B, n int) {
 	filename := "/tmp/bench_btree_scan.db"
 	defer os.Remove(filename)
 
-	store, err := CreateBTreeStore(filename, benchSchema())
+	store, err := CreateBTreeStore(filename, benchSchema(), context.Background(), &sync.WaitGroup{})
 	if err != nil {
 		b.Fatal(err)
 	}
@@ -280,7 +282,7 @@ func benchBTreeDelete(b *testing.B, n int) {
 		filename := fmt.Sprintf("/tmp/bench_btree_delete_%d.db", i)
 		defer os.Remove(filename)
 
-		store, err := CreateBTreeStore(filename, benchSchema())
+		store, err := CreateBTreeStore(filename, benchSchema(), context.Background(), &sync.WaitGroup{})
 		if err != nil {
 			b.Fatal(err)
 		}
@@ -320,7 +322,7 @@ func benchBTreeMixed(b *testing.B, n int) {
 	filename := "/tmp/bench_btree_mixed.db"
 	defer os.Remove(filename)
 
-	store, err := CreateBTreeStore(filename, benchSchema())
+	store, err := CreateBTreeStore(filename, benchSchema(), context.Background(), &sync.WaitGroup{})
 	if err != nil {
 		b.Fatal(err)
 	}

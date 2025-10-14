@@ -51,7 +51,7 @@ func (bt *BTree) findLeaf(key uint64, breadcrumbs *BTStack) (pager.PageID, error
 	for {
 		node, err := bt.loadNode(currentPageID)
 		if err != nil {
-			return 0, err
+			return 0, fmt.Errorf("failed to load page %d: %w", currentPageID, err)
 		}
 		defer bt.pc.UnPin(node.PageID)
 
@@ -99,7 +99,7 @@ func (bt *BTree) propogateSplit(promotedKey uint64, rightPageID, leftPageID page
 		bc, _ := breadcrumbs.pop()
 		parent, err := bt.loadNode(bc.PageID)
 		if err != nil {
-			return err
+			return fmt.Errorf("failed to load page %d: %w", bc.PageID, err)
 		}
 		defer bt.pc.UnPin(parent.PageID)
 
@@ -121,7 +121,7 @@ func (bt *BTree) propogateSplit(promotedKey uint64, rightPageID, leftPageID page
 			return bt.writeNode(parent)
 		}
 
-		if err.Error() != "page full" {
+		if !errors.Is(err, pager.ErrPageFull) {
 			// something went wrong other than a full page
 			return err
 		}
@@ -168,7 +168,7 @@ func (bt *BTree) Insert(key uint64, data []byte) error {
 
 	leaf, err := bt.loadNode(leafPageID)
 	if err != nil {
-		return err
+		return fmt.Errorf("failed to load page %d: %w", leafPageID, err)
 	}
 	defer bt.pc.UnPin(leaf.PageID)
 	if _, present := leaf.Search(key); present {
@@ -181,7 +181,7 @@ func (bt *BTree) Insert(key uint64, data []byte) error {
 		return bt.writeNode(leaf)
 	}
 
-	if err.Error() != "page full" {
+	if !errors.Is(err, pager.ErrPageFull) {
 		// bad path
 		return err
 	}
@@ -239,7 +239,7 @@ func (bt *BTree) Search(key uint64) ([]byte, bool, error) {
 	for depth := 0; depth < maxDepth; depth++ {
 		node, err := bt.loadNode(currentPageID)
 		if err != nil {
-			return nil, false, err
+			return nil, false, fmt.Errorf("failed to load page %d: %w", currentPageID, err)
 		}
 
 		if node.IsLeaf() {
@@ -285,7 +285,7 @@ func (bt *BTree) RangeScan(startKey, endKey uint64) ([][]byte, error) {
 			chain := "Cycle: "
 			current, _ := bt.findLeaf(startKey, &BTStack{})
 			for i := 0; i < 20 && current != 0; i++ {
-				n, _ := bt.loadNode(current)
+				n, _ := bt.loadNode(current) // swallows errors, but this an error case anyway
 				chain += fmt.Sprintf("%d->", current)
 				current = n.NextLeaf
 				bt.pc.UnPin(n.PageID)
@@ -296,7 +296,7 @@ func (bt *BTree) RangeScan(startKey, endKey uint64) ([][]byte, error) {
 
 		leaf, err := bt.loadNode(leafPageID)
 		if err != nil {
-			return nil, err
+			return nil, fmt.Errorf("failed to load page %d: %w", leafPageID, err)
 		}
 
 		for i := 0; i < int(leaf.NumSlots); i++ {
@@ -376,25 +376,25 @@ func (bt *BTree) mergeInternalNodes(leftNode, rightNode, parent *BNode, separato
 	demotedRecord := pager.SerializeInternalRecord(separatorKey, leftNode.RightmostChild)
 	_, err := leftNode.InsertRecordSorted(demotedRecord)
 	if err != nil {
-		return err
+		return fmt.Errorf("failed to insert demoted record into left node: %w", err)
 	}
 
 	// merge right into left
 	err = leftNode.MergeInternals(rightNode.SlottedPage)
 	if err != nil {
-		return err
+		return fmt.Errorf("failed to merge internal nodes %d and %d: %w", leftNode.PageID, rightNode.PageID, err)
 	}
 
 	// write merged node
 	if err := bt.writeNode(leftNode); err != nil {
-		return err
+		return fmt.Errorf("failed to write page %d: %w", leftNode.PageID, err)
 	}
 
 	bt.pc.FreePage(rightNode.PageID)
 
 	// remove separator from parent
 	if err := parent.DeleteRecord(separatorIndex); err != nil {
-		return err
+		return fmt.Errorf("failed to delete parent record at %d: %w", separatorIndex, err)
 	}
 
 	// after compact, records shift - separatorIndex now points to what was the next record
@@ -418,12 +418,12 @@ func (bt *BTree) mergeLeafNodes(leftNode, rightNode, parent *BNode, separatorInd
 
 	// always merge right into left
 	if err := leftNode.MergeLeaf(rightNode.SlottedPage); err != nil {
-		return err
+		return fmt.Errorf("failed to merge leaf nodes %d and %d: %w", leftNode.PageID, rightNode.PageID, err)
 	}
 
 	// write merged (left) node
 	if err := bt.writeNode(leftNode); err != nil {
-		return err
+		return fmt.Errorf("failed to write page %d: %w", leftNode.PageID, err)
 	}
 
 	// right node is always orphaned
@@ -431,7 +431,7 @@ func (bt *BTree) mergeLeafNodes(leftNode, rightNode, parent *BNode, separatorInd
 
 	// remove separator from parent
 	if err := parent.DeleteRecord(separatorIndex); err != nil {
-		return err
+		return fmt.Errorf("failed to delete parent record at %d: %w", separatorIndex, err)
 	}
 
 	// update parent pointer to point to left (survivor)
@@ -451,7 +451,7 @@ func (bt *BTree) handleRootUnderflow(pageID pager.PageID) error {
 	}
 	root, err := bt.loadNode(pageID)
 	if err != nil {
-		return err
+		return fmt.Errorf("failed to load page %d: %w", pageID, err)
 	}
 	defer bt.pc.UnPin(root.PageID)
 	if root.IsLeaf() {
@@ -489,13 +489,13 @@ func (bt *BTree) handleUnderflow(pageID pager.PageID, breadcrumbs *BTStack) erro
 	parent, err := bt.loadNode(bc.PageID)
 	if err != nil {
 		// error loading the node
-		return err
+		return fmt.Errorf("failed to load page %d: %w", bc.PageID, err)
 	}
 	defer bt.pc.UnPin(parent.PageID)
 
 	underflowNode, err := bt.loadNode(pageID)
 	if err != nil {
-		return err
+		return fmt.Errorf("failed to load page %d: %w", pageID, err)
 	}
 	defer bt.pc.UnPin(underflowNode.PageID)
 
@@ -524,7 +524,7 @@ func (bt *BTree) handleUnderflow(pageID pager.PageID, breadcrumbs *BTStack) erro
 
 	sibling, err := bt.loadNode(siblingID)
 	if err != nil {
-		return err
+		return fmt.Errorf("failed to load page %d: %w", siblingID, err)
 	}
 	defer bt.pc.UnPin(sibling.PageID)
 
@@ -539,9 +539,14 @@ func (bt *BTree) handleUnderflow(pageID pager.PageID, breadcrumbs *BTStack) erro
 		rightNode = sibling
 	}
 
-	// mergeIntoSibling == false means we found a right sibling
-	if !mergeIntoSibling && sibling.CanLendKeys() {
-		// and it can lend!
+	// try to borrow from the left node first, otherwise try to borrow from the right node
+	if leftNode.CanLendKeys() {
+		if leftNode.IsLeaf() {
+			return bt.borrowFromLeftLeaf(leftNode, rightNode, parent, separatorIndex)
+		} else {
+			return bt.borrowFromLeftInternal(leftNode, rightNode, parent, separatorIndex)
+		}
+	} else if rightNode.CanLendKeys() {
 		if leftNode.IsLeaf() {
 			return bt.borrowFromRightLeaf(leftNode, rightNode, parent, separatorIndex)
 		} else {
@@ -551,7 +556,7 @@ func (bt *BTree) handleUnderflow(pageID pager.PageID, breadcrumbs *BTStack) erro
 
 	// check if merge is possible (skip if too large)
 	if !leftNode.CanMergeWith(rightNode.SlottedPage) {
-		return nil // no merge occurs (this can be optimized later with "borrowing" or rebalances)
+		return nil // no merge occurs
 	}
 
 	// perform merge based on node type
@@ -592,7 +597,7 @@ func (bt *BTree) Delete(key uint64) error {
 	}
 	leaf, err := bt.loadNode(leafPageID)
 	if err != nil {
-		return err
+		return fmt.Errorf("failed to load page %d: %w", leafPageID, err)
 	}
 	defer bt.pc.UnPin(leaf.PageID)
 	idx, present := leaf.Search(key)
@@ -606,7 +611,7 @@ func (bt *BTree) Delete(key uint64) error {
 
 	// It was working when I commented out the merge. I think the node needs to write before starting the merge
 	if err := bt.writeNode(leaf); err != nil {
-		return err
+		return fmt.Errorf("delete: failed to write page %d: %w", leaf.PageID, err)
 	}
 
 	// check if nodes need to merge
@@ -672,17 +677,17 @@ func (bt *BTree) buildLeafLayer() ([]*pager.SlottedPage, error) {
 	for currPageID != 0 { // 0 means no sibling to the right, we're done
 		currentLeaf, err := bt.loadNode(currPageID)
 		if err != nil {
-			return nil, err
+			return nil, fmt.Errorf("failed to load page %d: %w", currPageID, err)
 		}
 		// iterate over leaf records
 		for i := 0; i < int(currentLeaf.NumSlots); i++ {
 			record, err := currentLeaf.GetRecord(i)
 			if err != nil {
-				return nil, err
+				return nil, fmt.Errorf("failed to get record %d from currentLeaf: %w", i, err)
 			}
 			// insert record into the newly created leaf node
 			_, err = newLeaf.InsertRecordSorted(record)
-			if err != nil && err.Error() == "page full" {
+			if err != nil && errors.Is(err, pager.ErrPageFull) {
 				// if the page was full, add it to the return slice, allocate a new leaf node
 				// and insert into that one
 				leaves = append(leaves, newLeaf)
@@ -690,10 +695,10 @@ func (bt *BTree) buildLeafLayer() ([]*pager.SlottedPage, error) {
 				newLeaf = pager.NewSlottedPage(pager.PageID(newLeafIndex), pager.LEAF)
 				_, err = newLeaf.InsertRecordSorted(record)
 				if err != nil {
-					return nil, err
+					return nil, fmt.Errorf("failed to insert record from page %d into newLeaf (after page full): %w", currentLeaf.PageID, err)
 				}
 			} else if err != nil {
-				return nil, err
+				return nil, fmt.Errorf("failed to insert record from page %d into newLeaf: %w", currentLeaf.PageID, err)
 			}
 		}
 		bt.pc.UnPin(currentLeaf.PageID)
@@ -736,16 +741,16 @@ func buildInternalLayer(children []*pager.SlottedPage) ([]*pager.SlottedPage, er
 		record := pager.SerializeInternalRecord(separatorKey, childPageID)
 		_, err := currentParent.InsertRecordSorted(record)
 
-		if err != nil && err.Error() == "page full" {
+		if err != nil && errors.Is(err, pager.ErrPageFull) {
 			parents = append(parents, currentParent)
 			nextPageID++
 			currentParent = pager.NewSlottedPage(nextPageID, pager.INTERNAL)
 			_, err := currentParent.InsertRecordSorted(record)
 			if err != nil {
-				return nil, err
+				return nil, fmt.Errorf("failed to insert record from page %d into currentParent (after page full): %w", childPageID, err)
 			}
 		} else if err != nil {
-			return nil, err
+			return nil, fmt.Errorf("failed to insert record from page %d into currentParent: %w", childPageID, err)
 		}
 	}
 
@@ -823,13 +828,13 @@ func (bt *BTree) borrowFromRightLeaf(leftNode, rightNode, parent *BNode, separat
 
 	// 5. write all three modified pages
 	if err := bt.writeNode(leftNode); err != nil {
-		return err
+		return fmt.Errorf("borrow: failed to write leftNode page %d: %w", leftNode.PageID, err)
 	}
 	if err := bt.writeNode(rightNode); err != nil {
-		return err
+		return fmt.Errorf("borrow: failed to write rightNode page %d: %w", rightNode.PageID, err)
 	}
 	if err := bt.writeNode(parent); err != nil {
-		return err
+		return fmt.Errorf("borrow: failed to write parent page %d: %w", parent.PageID, err)
 	}
 
 	return nil
@@ -874,13 +879,102 @@ func (bt *BTree) borrowFromRightInternal(leftNode, rightNode, parent *BNode, sep
 
 	// 6. write all three modified pages
 	if err := bt.writeNode(leftNode); err != nil {
-		return err
+		return fmt.Errorf("borrow: failed to write leftNode page %d: %w", leftNode.PageID, err)
 	}
 	if err := bt.writeNode(rightNode); err != nil {
-		return err
+		return fmt.Errorf("borrow: failed to write rightNode page %d: %w", rightNode.PageID, err)
 	}
 	if err := bt.writeNode(parent); err != nil {
+		return fmt.Errorf("borrow: failed to write parent page %d: %w", parent.PageID, err)
+	}
+
+	return nil
+}
+
+func (bt *BTree) borrowFromLeftLeaf(leftNode, rightNode, parent *BNode, separatorIndex int) error {
+	if !leftNode.IsLeaf() || !rightNode.IsLeaf() || parent.IsLeaf() {
+		return errors.New("both siblings must be LEAF, parent must be INTERNAL")
+	}
+
+	// 1. get last record from left sibling
+	if leftNode.NumSlots == 0 {
+		return fmt.Errorf("left sibling has no records to lend")
+	}
+	borrowedRecord := leftNode.Records[len(leftNode.Records)-1]
+
+	// 2. remove from left leaf
+	if err := leftNode.DeleteRecord(len(leftNode.Records) - 1); err != nil {
 		return err
+	}
+
+	// 3. Insert into right
+	if _, err := rightNode.InsertRecordSorted(borrowedRecord); err != nil {
+		return err
+	}
+
+	// 4. Update the parent separator
+	if rightNode.NumSlots == 0 {
+		return fmt.Errorf("right sibling empty after borrowing")
+	}
+
+	// considers shift from compact on delete
+	newSeparatorKey := rightNode.GetKey(0) // right's new first key
+	parent.Records[separatorIndex] = pager.SerializeInternalRecord(newSeparatorKey, leftNode.PageID)
+
+	// 5. write all three modified pages
+	if err := bt.writeNode(leftNode); err != nil {
+		return fmt.Errorf("borrow: failed to write leftNode page %d: %w", leftNode.PageID, err)
+	}
+	if err := bt.writeNode(rightNode); err != nil {
+		return fmt.Errorf("borrow: failed to write rightNode page %d: %w", rightNode.PageID, err)
+	}
+	if err := bt.writeNode(parent); err != nil {
+		return fmt.Errorf("borrow: failed to write parent page %d: %w", parent.PageID, err)
+	}
+
+	return nil
+}
+
+func (bt *BTree) borrowFromLeftInternal(leftNode, rightNode, parent *BNode, separatorIndex int) error {
+	if leftNode.IsLeaf() || rightNode.IsLeaf() || parent.IsLeaf() {
+		return errors.New("both siblings and parent must be INTERNAL")
+	}
+
+	// get the key to demote
+	separatorKey, _ := pager.DeserializeInternalRecord(parent.Records[separatorIndex])
+
+	// get key and child from left's last record (before deletion)
+	if leftNode.NumSlots == 0 {
+		return fmt.Errorf("left sibling has no records to lend")
+	}
+	lastKey, lastChild := pager.DeserializeInternalRecord(leftNode.Records[len(leftNode.Records)-1])
+
+	// 1. Demote separator into right, pointing to left's RightmostChild
+	demotedRecord := pager.SerializeInternalRecord(separatorKey, leftNode.RightmostChild)
+	if _, err := rightNode.InsertRecordSorted(demotedRecord); err != nil {
+		return err
+	}
+
+	// 2. Delete left's last record
+	if err := leftNode.DeleteRecord(len(leftNode.Records) - 1); err != nil {
+		return err
+	}
+
+	// 3. Left's new RightmostChild is the child from the deleted record
+	leftNode.RightmostChild = lastChild
+
+	// 4. Promote the deleted key to parent
+	parent.Records[separatorIndex] = pager.SerializeInternalRecord(lastKey, leftNode.PageID)
+
+	// 5. write all three modified pages
+	if err := bt.writeNode(leftNode); err != nil {
+		return fmt.Errorf("borrow: failed to write leftNode page %d: %w", leftNode.PageID, err)
+	}
+	if err := bt.writeNode(rightNode); err != nil {
+		return fmt.Errorf("borrow: failed to write rightNode page %d: %w", rightNode.PageID, err)
+	}
+	if err := bt.writeNode(parent); err != nil {
+		return fmt.Errorf("borrow: failed to write parent page %d: %w", parent.PageID, err)
 	}
 
 	return nil

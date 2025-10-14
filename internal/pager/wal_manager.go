@@ -3,6 +3,7 @@ package pager
 import (
 	"context"
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"godb/internal/encoding"
 	"io"
@@ -86,18 +87,18 @@ func (wm *WALManager) writeRecords(records []WALRecord) error {
 	for i := range records {
 		fileOffset, err := wm.getCurrentOffset()
 		if err != nil {
-			return err
+			return fmt.Errorf("failed to get WAL offset: %w", err)
 		}
 
 		records[i].Lsn = LSN(fileOffset)
 		data, err := records[i].Serialize()
 		if err != nil {
-			return err
+			return fmt.Errorf("failed to serialize WAL record: %w", err)
 		}
 
 		_, err = wm.file.Write(data)
 		if err != nil {
-			return err
+			return fmt.Errorf("failed to write WAL record to disk: %w", err)
 		}
 	}
 	return wm.file.Sync()
@@ -113,9 +114,11 @@ func (wm *WALManager) ReadAll() ([]WALRecord, error) {
 
 	for {
 		record, err := wm.Deserialize()
-		if err != nil && err == io.EOF {
-			break
-		} else if err != nil {
+		if err != nil {
+			// Check if it's EOF (wrapped or unwrapped)
+			if errors.Is(err, io.EOF) {
+				break
+			}
 			return nil, err
 		}
 		records = append(records, *record)

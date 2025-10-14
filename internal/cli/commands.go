@@ -200,7 +200,7 @@ func commandAbort(config *DatabaseConfig, params []string, w io.Writer) error {
 func commandCommit(config *DatabaseConfig, params []string, w io.Writer) error {
 	fmt.Fprintln(w, "Committing transaction...")
 	if err := config.TableS.Commit(config.txnBuffer); err != nil {
-		return err
+		return fmt.Errorf("failed to commit transaction: %w", err)
 	}
 	fmt.Fprintln(w, "Transaction committed successfully!")
 	config.inTransaction = false
@@ -267,7 +267,7 @@ func commandDrop(config *DatabaseConfig, params []string, w io.Writer) error {
 	fmt.Fprintf(w, "Dropping table %s...\n", tName)
 	err := os.Remove(fName)
 	if err != nil && !os.IsNotExist(err) {
-		return err
+		return fmt.Errorf("failed to delete table file '%s': %w", fName, err)
 	}
 
 	tableCacheMu.Lock()
@@ -287,7 +287,7 @@ func commandDescribe(config *DatabaseConfig, params []string, w io.Writer) error
 		fName := rec.Name
 		fType, err := fieldString(rec.Type)
 		if err != nil {
-			return err
+			return fmt.Errorf("describe: failed to extract field type '%s': %w", rec.Name, err)
 		}
 		if i == 0 {
 			pKeyHuh = " - PRIMARY KEY"
@@ -322,7 +322,7 @@ func commandCreate(config *DatabaseConfig, params []string, w io.Writer) error {
 		fieldName := parts[0]
 		fieldType, err := schema.ParseFieldType(parts[1])
 		if err != nil {
-			return err
+			return fmt.Errorf("create: failed to parse field type '%s': %w", fieldName, err)
 		}
 
 		fields = append(fields, schema.Field{
@@ -338,7 +338,7 @@ func commandCreate(config *DatabaseConfig, params []string, w io.Writer) error {
 
 	newTableStore, err := store.CreateBTreeStore(fName, sch, config.ctx, config.wg)
 	if err != nil {
-		return err
+		return fmt.Errorf("create: failed to create a BTreeStore for '%s': %w", tName, err)
 	}
 
 	// add to cache to it gets checkpointed/closed on exit
@@ -360,7 +360,7 @@ func commandUse(config *DatabaseConfig, params []string, w io.Writer) error {
 
 	ts, err := GetOrOpenTable(tName+".db", config.ctx, config.wg)
 	if err != nil {
-		return err
+		return fmt.Errorf("use: failed to retrieve table '%s': %w", tName, err)
 	}
 	config.TableS = ts
 	fmt.Fprintf(w, "Switching to table: %s\n", tName)
@@ -370,7 +370,7 @@ func commandUse(config *DatabaseConfig, params []string, w io.Writer) error {
 func commandShow(config *DatabaseConfig, params []string, w io.Writer) error {
 	files, err := os.ReadDir(".")
 	if err != nil {
-		return err
+		return fmt.Errorf("show: failed to list tables: %w", err)
 	}
 
 	for _, file := range files {
@@ -409,7 +409,7 @@ func commandExit(config *DatabaseConfig, params []string, w io.Writer) error {
 		}
 		err := v.Close()
 		if err != nil {
-			return err
+			return fmt.Errorf("close: failed to close table '%s': %w", v.Schema().TableName, err)
 		}
 	}
 	return nil
@@ -423,13 +423,13 @@ func commandDelete(config *DatabaseConfig, params []string, w io.Writer) error {
 
 	key, err := strconv.Atoi(params[0])
 	if err != nil {
-		return fmt.Errorf("error parsing primary key: %v", params[0])
+		return fmt.Errorf("invalid primary key '%s' (must be integer): %w", params[0], err)
 	}
 
 	if config.inTransaction {
 		wr, err := config.TableS.PrepareDelete(uint64(key))
 		if err != nil {
-			return err
+			return fmt.Errorf("delete: failed to prepare delete transaction %d: %w", key, err)
 		}
 		config.txnBuffer = append(config.txnBuffer, wr)
 		return nil
@@ -440,7 +440,10 @@ func commandDelete(config *DatabaseConfig, params []string, w io.Writer) error {
 		}
 
 		fmt.Fprintf(w, "Deleting %+v from table %s\n", record, config.TableS.Schema().TableName)
-		return config.TableS.Delete(uint64(key))
+		if err := config.TableS.Delete(uint64(key)); err != nil {
+			return fmt.Errorf("delete failed for key %d: %w", key, err)
+		}
+		return nil
 	}
 
 }
@@ -467,18 +470,18 @@ func commandUpdate(config *DatabaseConfig, params []string, w io.Writer) error {
 
 	key, err := config.TableS.ExtractPrimaryKey(record)
 	if err != nil {
-		return err
+		return fmt.Errorf("update - failed to extract primary key from table '%s': %w", config.TableS.Schema().TableName, err)
 	}
 
 	if config.inTransaction {
 		wr, err := config.TableS.PrepareInsert(record)
 		if err != nil {
-			return err
+			return fmt.Errorf("update - failed to prepare insert: %w", err)
 		}
 		config.txnBuffer = append(config.txnBuffer, wr)
 		wr, err = config.TableS.PrepareDelete(uint64(key))
 		if err != nil {
-			return err
+			return fmt.Errorf("update - failed to prepare delete: %w", err)
 		}
 		config.txnBuffer = append(config.txnBuffer, wr)
 		return nil
@@ -487,7 +490,7 @@ func commandUpdate(config *DatabaseConfig, params []string, w io.Writer) error {
 
 		err := config.TableS.Delete(uint64(key))
 		if err != nil {
-			return err
+			return fmt.Errorf("update - failed to delete key %d: %w", key, err)
 		}
 		return config.TableS.Insert(record)
 	}
@@ -514,12 +517,12 @@ func commandInsert(config *DatabaseConfig, params []string, w io.Writer) error {
 	if config.inTransaction {
 		wr, err := config.TableS.PrepareInsert(record)
 		if err != nil {
-			return err
+			return fmt.Errorf("insert - failed to prepare insert: %w", err)
 		}
 		config.txnBuffer = append(config.txnBuffer, wr)
 	} else {
 		if err := config.TableS.Insert(record); err != nil {
-			return err
+			return fmt.Errorf("insert - failed to insert: %w", err)
 		}
 	}
 
@@ -529,7 +532,7 @@ func commandInsert(config *DatabaseConfig, params []string, w io.Writer) error {
 func selectAll(config *DatabaseConfig, w io.Writer) error {
 	records, err := config.TableS.ScanAll()
 	if err != nil {
-		return err
+		return fmt.Errorf("selectall - failed to scan all: %w", err)
 	}
 
 	fieldNames := config.TableS.Schema().GetFieldNames()
@@ -559,16 +562,16 @@ func selectAll(config *DatabaseConfig, w io.Writer) error {
 func rangeScan(config *DatabaseConfig, w io.Writer, params []string) error {
 	startKey, err := strconv.Atoi(params[0])
 	if err != nil {
-		return err
+		return fmt.Errorf("rangescan - invalid start key '%s': %w", params[0], err)
 	}
 	endKey, err := strconv.Atoi(params[1])
 	if err != nil {
-		return err
+		return fmt.Errorf("rangescan - invalid end key '%s': %w", params[1], err)
 	}
 
 	records, err := config.TableS.RangeScan(uint64(startKey), uint64(endKey))
 	if err != nil {
-		return err
+		return fmt.Errorf("rangescan - failed to scan range %d-%d: %w", startKey, endKey, err)
 	}
 
 	fieldNames := config.TableS.Schema().GetFieldNames()
@@ -618,10 +621,11 @@ func commandSelect(config *DatabaseConfig, params []string, w io.Writer) error {
 
 	key, err := strconv.Atoi(params[0])
 	if err != nil {
-		return err
+		return fmt.Errorf("select - invalid key '%s': %w", params[0], err)
 	}
 
 	record, err := config.TableS.Find(key)
+	// save error handling for after table layout print
 
 	fmt.Fprint(w, "| ")
 	for i, field := range config.TableS.Schema().Fields {
@@ -630,7 +634,10 @@ func commandSelect(config *DatabaseConfig, params []string, w io.Writer) error {
 	}
 	fmt.Fprintln(w)
 
-	return err
+	if err != nil {
+		return fmt.Errorf("select - unable to find key %d: %w", key, err)
+	}
+	return nil
 }
 
 func commandCount(config *DatabaseConfig, params []string, w io.Writer) error {
@@ -645,11 +652,11 @@ func commandCount(config *DatabaseConfig, params []string, w io.Writer) error {
 	if len(params) == 2 {
 		sk, err := strconv.Atoi(params[0])
 		if err != nil {
-			return err
+			return fmt.Errorf("count - invalid start key '%s': %w", params[0], err)
 		}
 		ek, err := strconv.Atoi(params[1])
 		if err != nil {
-			return err
+			return fmt.Errorf("count - invalid end key '%s': %w", params[1], err)
 		}
 		startKey = uint64(sk)
 		endKey = uint64(ek)
@@ -658,14 +665,14 @@ func commandCount(config *DatabaseConfig, params []string, w io.Writer) error {
 	if len(params) == 1 {
 		sk, err := strconv.Atoi(params[0])
 		if err != nil {
-			return err
+			return fmt.Errorf("count - invalid key '%s': %w", params[0], err)
 		}
 		startKey = uint64(sk)
 		endKey = uint64(sk)
 	}
 	records, err := config.TableS.RangeScan(startKey, endKey)
 	if err != nil {
-		return err
+		return fmt.Errorf("count - range scan failed: %w", err)
 	}
 	count := len(records)
 	fmt.Fprintf(w, "Count: %d\n", count)

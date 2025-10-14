@@ -2,6 +2,7 @@ package encoding
 
 import (
 	"encoding/binary"
+	"fmt"
 	"io"
 	"math"
 )
@@ -10,13 +11,16 @@ func WriteUint32(w io.Writer, v uint32) error {
 	buf := make([]byte, 4)
 	binary.LittleEndian.PutUint32(buf, v)
 	_, err := w.Write(buf)
-	return err
+	if err != nil {
+		return fmt.Errorf("failed to write uint32 %d: %w", v, err)
+	}
+	return nil
 }
 func ReadUint32(r io.Reader) (uint32, error) {
 	buf := make([]byte, 4)
 	_, err := io.ReadFull(r, buf)
 	if err != nil {
-		return 0, err
+		return 0, fmt.Errorf("failed to read uint32: %w", err)
 	}
 	return binary.LittleEndian.Uint32(buf), nil
 }
@@ -24,13 +28,16 @@ func WriteInt64(w io.Writer, v int64) error {
 	buf := make([]byte, 8)
 	binary.LittleEndian.PutUint64(buf, uint64(v))
 	_, err := w.Write(buf)
-	return err
+	if err != nil {
+		return fmt.Errorf("failed to write int64 %d: %w", v, err)
+	}
+	return nil
 }
 func ReadInt64(r io.Reader) (int64, error) {
 	buf := make([]byte, 8)
 	_, err := io.ReadFull(r, buf)
 	if err != nil {
-		return 0, err
+		return 0, fmt.Errorf("failed to read int64: %w", err)
 	}
 	return int64(binary.LittleEndian.Uint64(buf)), nil
 }
@@ -39,20 +46,23 @@ func WriteString(w io.Writer, s string) error {
 		return err
 	}
 	_, err := w.Write([]byte(s))
-	return err
+	if err != nil {
+		return fmt.Errorf("failed to write string %s: %w", s, err)
+	}
+	return nil
 }
 func ReadString(r io.Reader) (string, error) {
 	lenBytes := make([]byte, 4)
 	_, err := io.ReadFull(r, lenBytes)
 	if err != nil {
-		return "", err
+		return "", fmt.Errorf("failed to read string length: %w", err)
 	}
 	nameLength := binary.LittleEndian.Uint32(lenBytes)
 
 	nameBytes := make([]byte, nameLength)
 	_, err = io.ReadFull(r, nameBytes)
 	if err != nil {
-		return "", err
+		return "", fmt.Errorf("failed to read string value: %w", err)
 	}
 
 	return string(nameBytes), nil
@@ -61,13 +71,16 @@ func WriteFloat64(w io.Writer, v float64) error {
 	buf := make([]byte, 8)
 	binary.LittleEndian.PutUint64(buf, math.Float64bits(v))
 	_, err := w.Write(buf)
-	return err
+	if err != nil {
+		return fmt.Errorf("failed to write float64 %f: %w", v, err)
+	}
+	return nil
 }
 
 func ReadFloat64(r io.Reader) (float64, error) {
 	buf := make([]byte, 8)
 	if _, err := io.ReadFull(r, buf); err != nil {
-		return 0, err
+		return 0, fmt.Errorf("failed to read float64: %w", err)
 	}
 	bits := binary.LittleEndian.Uint64(buf)
 	return math.Float64frombits(bits), nil
@@ -77,14 +90,14 @@ func ReadByteSlice(r io.Reader) ([]byte, error) {
 	lenBytes := make([]byte, 4)
 	_, err := io.ReadFull(r, lenBytes)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("failed to read byte slice length: %w", err)
 	}
 	sliceLength := binary.LittleEndian.Uint32(lenBytes)
 
 	bytes := make([]byte, sliceLength)
 	_, err = io.ReadFull(r, bytes)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("failed to read byte slice value: %w", err)
 	}
 
 	return bytes, nil
