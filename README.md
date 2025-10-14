@@ -1,6 +1,6 @@
 # go-database
 
-A database implementation in Go with B+ tree storage, WAL, and ACID transactions. Built as a learning project following "Database Internals" by Alex Petrov (~6500 LOC).
+A database implementation in Go with B+ tree storage, WAL, and ACID transactions. Built as a learning project following "Database Internals" by Alex Petrov (~4,500 LOC without tests).
 
 ## Features
 
