@@ -17,7 +17,7 @@ A database implementation in Go with B+ tree storage, WAL, and ACID transactions
 - **Context-based graceful shutdown** (signal handling, WaitGroup coordination)
 - **CRC32 page-level checksums** (corruption detection)
 - **Sequential insert optimization** (70/30 split ratio for monotonic keys)
-- **Right-sibling borrowing** (reduces page underflow fragmentation)
+- **Left/Right-sibling borrowing** (reduces page underflow fragmentation)
 
 ## Quick Start
 
