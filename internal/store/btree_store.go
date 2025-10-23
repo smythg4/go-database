@@ -17,8 +17,9 @@ import (
 )
 
 type BTreeStore struct {
-	bt  *btree.BTree
-	wal *pager.WALManager
+	bt         *btree.BTree
+	wal        *pager.WALManager
+	tableBloom *BloomFilter
 
 	wg  *sync.WaitGroup
 	ctx context.Context
@@ -70,6 +71,10 @@ func NewBTreeStore(filename string, ctx context.Context, wg *sync.WaitGroup) (*B
 		return nil, fmt.Errorf("failed to recover from WAL: %w", err)
 	}
 
+	if err := bts.rebuildBloomFilter(); err != nil {
+		return nil, err
+	}
+
 	wg.Add(1)
 	go bts.startCheckpointer()
 	return bts, nil
@@ -107,6 +112,10 @@ func CreateBTreeStore(filename string, sch schema.Schema, ctx context.Context, w
 	// Replay WAL to recover any uncommitted operations (if WAL exists)
 	if err := bts.Recover(); err != nil {
 		return nil, fmt.Errorf("failed to recover from WAL: %w", err)
+	}
+
+	if err := bts.rebuildBloomFilter(); err != nil {
+		return nil, err
 	}
 
 	wg.Add(1)
@@ -153,11 +162,9 @@ func (bts *BTreeStore) Insert(record schema.Record) error {
 		return fmt.Errorf("insert: failed to log WAL insert: %w", err)
 	}
 
-	// CRASH HERE: WAL written, but tree not modified
-	// if key == 999 { // Special test key
-	// 	fmt.Println("SIMULATING CRASH!")
-	// 	os.Exit(1)
-	// }
+	if bts.tableBloom != nil {
+		bts.tableBloom.Add(key)
+	}
 
 	return bts.bt.Insert(key, data)
 }
@@ -174,6 +181,11 @@ func (bts *BTreeStore) Delete(key uint64) error {
 func (bts *BTreeStore) Find(key int) (schema.Record, error) {
 	bts.mu.RLock()
 	defer bts.mu.RUnlock()
+
+	if bts.tableBloom != nil && !bts.tableBloom.MayContain(uint64(key)) {
+		// key definitely not in table
+		return nil, fmt.Errorf("record %d not found", key)
+	}
 
 	data, found, err := bts.bt.Search(uint64(key))
 	if err != nil {
@@ -214,7 +226,12 @@ func (bts *BTreeStore) Vacuum() error {
 	if err := bts.LogVacuum(); err != nil {
 		return fmt.Errorf("vacuum: failed to log WAL vacuum: %w", err)
 	}
-	return bts.bt.Vacuum()
+	if err := bts.bt.Vacuum(); err != nil {
+		return err
+	}
+
+	// Rebuild bloom filter after vacuum to remove false positives from deletes
+	return bts.rebuildBloomFilter()
 }
 
 func (bts *BTreeStore) ScanAll() ([]schema.Record, error) {
@@ -388,5 +405,38 @@ func (bts *BTreeStore) LogUpdate(key uint64, recordBytes []byte) error {
 	if err := bts.wal.LogUpdate(key, recordBytes); err != nil {
 		return fmt.Errorf("failed to log WAL update: %w", err)
 	}
+	return nil
+}
+
+func (bts *BTreeStore) rebuildBloomFilter() error {
+	// Count existing records to size bloom filter appropriately
+	// NOTE: caller must hold lock
+
+	records, err := bts.ScanAll()
+	if err != nil {
+		return err
+	}
+
+	// Create bloom filter sized for current data + growth
+	numKeys := len(records) * 2 // 2x for growth headroom
+	if numKeys == 0 {
+		numKeys = 1000
+	}
+
+	numKeys *= 2
+
+	numBits, numHashes := OptimalBloomSize(uint(numKeys), 0.01)
+
+	bts.tableBloom = NewBloomFilter(numBits, numHashes)
+
+	// Add all existing keys
+	for _, record := range records {
+		key, err := bts.bt.ExtractPrimaryKey(record)
+		if err != nil {
+			return err
+		}
+		bts.tableBloom.Add(key)
+	}
+
 	return nil
 }

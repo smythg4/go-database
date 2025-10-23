@@ -586,3 +586,4 @@ The user learns best through guided exploration, not guided implementation.
 - "Introduction to Algorithms" (CLRS) - B-tree fundamentals
 - Slotted page layout (standard in PostgreSQL, SQLite, most RDBMS)
 - Clock eviction algorithm (second-chance page replacement)
+- let's add a test for data race conditions
